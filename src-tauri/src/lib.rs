@@ -121,9 +121,6 @@ pub struct RemoteConnection { pub remote_ip: String, pub remote_port: u16, pub l
 #[serde(rename_all = "camelCase")]
 pub struct SandboxStatus { pub environment: String, pub level: String, pub details: String, pub indicators: Vec<String> }
 
-#[derive(Deserialize)]
-struct GeoResponse { success: bool, country: Option<String>, city: Option<String>, latitude: Option<f64>, longitude: Option<f64> }
-
 #[derive(Default)]
 struct ProcessRecord { pid: u32, name: String, owner: String, bindings: Vec<(String, u16)> }
 
@@ -450,10 +447,12 @@ fn is_private_host(ip: &str) -> bool {
 fn lookup_geo(ip: &str) -> Option<GeoLocation> {
   let cache = GEO_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
   if let Ok(values) = cache.lock() { if let Some(value) = values.get(ip) { return value.clone(); } }
-  let output = Command::new("/usr/bin/curl").args(["-sS", "--max-time", "3", &format!("https://ipwho.is/{ip}")]).output().ok();
-  let location = output.and_then(|data| serde_json::from_slice::<GeoResponse>(&data.stdout).ok()).and_then(|response| {
-    if response.success { Some(GeoLocation { city: response.city.unwrap_or_else(|| "Unknown city".into()), country: response.country.unwrap_or_else(|| "Unknown country".into()), latitude: response.latitude?, longitude: response.longitude? }) } else { None }
-  });
+  let location = (|| {
+    let path = std::env::var_os("PORTMAN_GEOIP_DB")?; let reader = maxminddb::Reader::open_readfile(path).ok()?; let address = ip.parse().ok()?; let record = reader.lookup(address).ok()?.decode::<maxminddb::geoip2::City>().ok()??;
+    let country = record.country.iso_code.unwrap_or("Unknown").to_string();
+    let city = record.city.names.english.unwrap_or("Offline GeoIP").to_string();
+    Some(GeoLocation { city, country, latitude: record.location.latitude.unwrap_or(0.0), longitude: record.location.longitude.unwrap_or(0.0) })
+  })();
   if let Ok(mut values) = cache.lock() { values.insert(ip.to_string(), location.clone()); }
   location
 }

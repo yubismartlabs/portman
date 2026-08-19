@@ -41,6 +41,22 @@ pub struct ProcessMetrics {
 
 struct MetricsState(Mutex<System>);
 static BINARY_TRUST_CACHE: OnceLock<Mutex<HashMap<String, BinaryTrust>>> = OnceLock::new();
+static GEO_CACHE: OnceLock<Mutex<HashMap<String, Option<GeoLocation>>>> = OnceLock::new();
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeoLocation { pub city: String, pub country: String, pub latitude: f64, pub longitude: f64 }
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteConnection { pub remote_ip: String, pub remote_port: u16, pub location: Option<GeoLocation> }
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SandboxStatus { pub environment: String, pub level: String, pub details: String, pub indicators: Vec<String> }
+
+#[derive(Deserialize)]
+struct GeoResponse { success: bool, country: Option<String>, city: Option<String>, latitude: Option<f64>, longitude: Option<f64> }
 
 #[derive(Default)]
 struct ProcessRecord { pid: u32, name: String, owner: String, bindings: Vec<(String, u16)> }
@@ -119,6 +135,30 @@ fn scan_listeners() -> Result<Vec<Listener>, String> {
   Ok(parse_lsof(&String::from_utf8_lossy(&output.stdout), &uid))
 }
 
+fn env_present(name: &str) -> bool { std::env::var_os(name).is_some_and(|value| !value.is_empty()) }
+
+fn sandbox_status() -> SandboxStatus {
+  let mut indicators = Vec::new();
+  if env_present("APP_SANDBOX_CONTAINER_ID") { indicators.push("APP_SANDBOX_CONTAINER_ID".into()); }
+  if std::env::var("HOME").ok().is_some_and(|home| home.contains("/Library/Containers/")) { indicators.push("App container home directory".into()); }
+  if !indicators.is_empty() { return SandboxStatus { environment: "macOS App Sandbox".into(), level: "process".into(), details: "The process is isolated by macOS App Sandbox entitlements.".into(), indicators }; }
+
+  if env_present("SNAP") { return SandboxStatus { environment: "Snap sandbox".into(), level: "process".into(), details: "The process is confined by Snap.".into(), indicators: vec!["SNAP".into()] }; }
+  if env_present("FLATPAK_ID") { return SandboxStatus { environment: "Flatpak sandbox".into(), level: "process".into(), details: "The process is confined by Flatpak.".into(), indicators: vec!["FLATPAK_ID".into()] }; }
+  if env_present("WSL_INTEROP") || env_present("WSL_DISTRO_NAME") { return SandboxStatus { environment: "Windows Subsystem for Linux".into(), level: "virtualized".into(), details: "The process runs in a WSL virtualized Linux environment.".into(), indicators: vec!["WSL environment variable".into()] }; }
+  if Path::new("/.dockerenv").exists() { return SandboxStatus { environment: "Docker container".into(), level: "container".into(), details: "The process runs inside a Docker container.".into(), indicators: vec!["/.dockerenv".into()] }; }
+  if let Ok(cgroup) = std::fs::read_to_string("/proc/1/cgroup") {
+    let value = cgroup.to_ascii_lowercase();
+    if ["docker", "containerd", "kubepods", "podman", "lxc"].iter().any(|marker| value.contains(marker)) {
+      return SandboxStatus { environment: "Linux container".into(), level: "container".into(), details: "The process is running in a Linux container environment.".into(), indicators: vec!["/proc/1/cgroup".into()] };
+    }
+  }
+  SandboxStatus { environment: "No known sandbox detected".into(), level: "none".into(), details: "No Docker, WSL, Snap, Flatpak, or macOS App Sandbox markers were found.".into(), indicators: vec![] }
+}
+
+#[tauri::command]
+fn process_sandbox_status() -> SandboxStatus { sandbox_status() }
+
 fn owned_process(pid: u32) -> Result<(), String> {
   let listeners = scan_listeners()?;
   let listener = listeners.iter().find(|item| item.pid == pid).ok_or_else(|| "This process is no longer listening.".to_string())?;
@@ -162,6 +202,41 @@ fn process_metrics(pid: u32, state: State<MetricsState>) -> Result<ProcessMetric
   })
 }
 
+fn parse_socket(value: &str) -> Option<(String, u16)> {
+  let endpoint = value.trim().trim_matches(['[', ']']);
+  let separator = endpoint.rfind(':')?;
+  Some((endpoint[..separator].trim_matches(['[', ']']).to_string(), endpoint[separator + 1..].parse().ok()?))
+}
+
+fn is_private_host(ip: &str) -> bool {
+  if matches!(ip, "localhost" | "::1" | "::" | "0.0.0.0") || ip.starts_with("127.") || ip.starts_with("10.") || ip.starts_with("192.168.") || ip.starts_with("169.254.") || ip.starts_with("fc") || ip.starts_with("fd") || ip.starts_with("fe80:") { return true; }
+  let octets: Vec<u8> = ip.split('.').filter_map(|part| part.parse().ok()).collect();
+  octets.len() == 4 && octets[0] == 172 && (16..=31).contains(&octets[1])
+}
+
+fn lookup_geo(ip: &str) -> Option<GeoLocation> {
+  let cache = GEO_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+  if let Ok(values) = cache.lock() { if let Some(value) = values.get(ip) { return value.clone(); } }
+  let output = Command::new("/usr/bin/curl").args(["-sS", "--max-time", "3", &format!("https://ipwho.is/{ip}")]).output().ok();
+  let location = output.and_then(|data| serde_json::from_slice::<GeoResponse>(&data.stdout).ok()).and_then(|response| {
+    if response.success { Some(GeoLocation { city: response.city.unwrap_or_else(|| "Unknown city".into()), country: response.country.unwrap_or_else(|| "Unknown country".into()), latitude: response.latitude?, longitude: response.longitude? }) } else { None }
+  });
+  if let Ok(mut values) = cache.lock() { values.insert(ip.to_string(), location.clone()); }
+  location
+}
+
+#[tauri::command]
+fn outbound_connections(pid: u32) -> Result<Vec<RemoteConnection>, String> {
+  let output = Command::new("/usr/sbin/lsof").args(["-nP", "-a", "-p", &pid.to_string(), "-iTCP", "-sTCP:ESTABLISHED", "-Fn"]).output().map_err(|e| format!("Could not inspect connections: {e}"))?;
+  let mut endpoints = BTreeMap::new();
+  for line in String::from_utf8_lossy(&output.stdout).lines() {
+    if let Some(remote) = line.strip_prefix('n').and_then(|value| value.split("->").nth(1)).and_then(parse_socket) {
+      if !is_private_host(&remote.0) { endpoints.insert(remote, ()); }
+    }
+  }
+  Ok(endpoints.into_keys().take(12).map(|(remote_ip, remote_port)| RemoteConnection { location: lookup_geo(&remote_ip), remote_ip, remote_port }).collect())
+}
+
 #[tauri::command]
 fn open_listener(listener: Listener) -> Result<String, String> {
   let raw = listener.bindings.first().map(|b| b.address.as_str()).unwrap_or("127.0.0.1");
@@ -183,7 +258,7 @@ fn start_watcher(app: AppHandle) {
 
 pub fn run() {
   tauri::Builder::default().manage(MetricsState(Mutex::new(System::new()))).plugin(tauri_plugin_opener::init()).setup(|app| { start_watcher(app.handle().clone()); Ok(()) })
-    .invoke_handler(tauri::generate_handler![list_listeners, stop_listener, force_stop_listener, process_metrics, open_listener])
+    .invoke_handler(tauri::generate_handler![list_listeners, stop_listener, force_stop_listener, process_metrics, outbound_connections, open_listener, process_sandbox_status])
     .run(tauri::generate_context!()).expect("error while running PortMan");
 }
 

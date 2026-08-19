@@ -21,3 +21,14 @@ export type ProcessMetrics = {
   readBytesPerSec: number;
   writeBytesPerSec: number;
 };
+
+export type GeoLocation = { city: string; country: string; latitude: number; longitude: number };
+export type RemoteConnection = { remoteIp: string; remotePort: number; location: GeoLocation | null };
+
+export type IsolationLevel = "none" | "process" | "container" | "virtualized";
+export type SandboxStatus = {
+  environment: string;
+  level: IsolationLevel;
+  details: string;
+  indicators: string[];
+};

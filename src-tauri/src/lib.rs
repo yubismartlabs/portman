@@ -58,7 +58,12 @@ pub struct ExecutableInspection { pub name: String, pub path: String, pub is_exe
 #[serde(rename_all = "camelCase")]
 pub struct InstanceAnomaly { pub pid: u32, pub score: f64, pub baseline_samples: u32, pub is_anomalous: bool, pub summary: String, pub cpu_percent: f32, pub memory_bytes: u64, pub outbound_connections: usize, pub novel_remote_connections: usize }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StopRisk { pub level: String, pub score: u8, pub blocked: bool, pub reasons: Vec<String>, pub consequence: String, pub previous_stops: u32 }
+
 struct MetricsState(Mutex<System>);
+struct StopHistoryState(Mutex<HashMap<String, u32>>);
 static BINARY_TRUST_CACHE: OnceLock<Mutex<HashMap<String, BinaryTrust>>> = OnceLock::new();
 static GEO_CACHE: OnceLock<Mutex<HashMap<String, Option<GeoLocation>>>> = OnceLock::new();
 static ANOMALY_CACHE: OnceLock<Mutex<HashMap<String, ProcessBaseline>>> = OnceLock::new();
@@ -138,6 +143,38 @@ fn executable_for(pid: u32) -> Option<String> {
   let executable = String::from_utf8_lossy(&output.stdout).trim().to_string();
   (!executable.is_empty() && Path::new(&executable).exists()).then_some(executable)
 }
+
+struct SystemBinaryProfile { names: &'static [&'static str], vector: &'static [&'static str], consequence: &'static str }
+const CRITICAL_BINARIES: &[SystemBinaryProfile] = &[
+  SystemBinaryProfile { names: &["windowserver"], vector: &["window", "display", "compositor", "system"], consequence: "Stopping WindowServer ends the macOS graphical session and can immediately log you out." },
+  SystemBinaryProfile { names: &["launchd"], vector: &["launch", "service", "system", "init"], consequence: "Stopping launchd destabilizes core system service management and can force a restart." },
+  SystemBinaryProfile { names: &["kernel_task"], vector: &["kernel", "system", "task"], consequence: "Stopping kernel_task can destabilize macOS and may force a system restart." },
+  SystemBinaryProfile { names: &["loginwindow"], vector: &["login", "window", "session", "system"], consequence: "Stopping loginwindow ends the active user session and logs you out." },
+  SystemBinaryProfile { names: &["lsass.exe", "csrss.exe", "wininit.exe", "services.exe"], vector: &["windows", "security", "session", "system"], consequence: "Stopping this Windows system process causes Windows to terminate the session or restart." },
+];
+
+fn binary_tokens(value: &str) -> Vec<String> { value.to_ascii_lowercase().split(|character: char| !character.is_ascii_alphanumeric()).filter(|token| !token.is_empty()).map(str::to_string).collect() }
+fn vector_similarity(tokens: &[String], vector: &[&str]) -> f64 { let shared = vector.iter().filter(|feature| tokens.iter().any(|token| token == **feature)).count() as f64; if tokens.is_empty() { 0.0 } else { shared / ((tokens.len() * vector.len()) as f64).sqrt() } }
+
+fn stop_risk_for_pid(pid: u32, history: &StopHistoryState) -> Result<StopRisk, String> {
+  let executable = executable_for(pid).unwrap_or_else(|| command_for(pid));
+  let name = Path::new(&executable).file_name().and_then(|value| value.to_str()).unwrap_or(&executable).to_ascii_lowercase();
+  let tokens = binary_tokens(&format!("{name} {executable}"));
+  let previous_stops = history.0.lock().ok().and_then(|values| values.get(&executable).copied()).unwrap_or(0);
+  for profile in CRITICAL_BINARIES {
+    if profile.names.iter().any(|known| name == *known) || vector_similarity(&tokens, profile.vector) > 0.82 { return Ok(StopRisk { level: "critical".into(), score: 100, blocked: true, reasons: vec![format!("Matches protected system binary profile: {name}")], consequence: "PortMan blocked this action. ".to_string() + profile.consequence, previous_stops }); }
+  }
+  let listener_count = scan_listeners().unwrap_or_default().iter().filter(|listener| listener.pid == pid).count();
+  let mut score: u8 = if listener_count > 0 { 45 } else { 10 }; let mut reasons = Vec::new();
+  if listener_count > 0 { reasons.push(format!("This instance is serving {listener_count} local listener(s).")); }
+  if previous_stops > 0 { score = score.saturating_sub(10); reasons.push(format!("You previously stopped this executable {previous_stops} time(s) in this session.")); }
+  Ok(StopRisk { level: if score >= 35 { "medium" } else { "low" }.into(), score, blocked: false, reasons, consequence: if listener_count > 0 { "Stopping it interrupts its local service and connected clients.".into() } else { "No protected system impact was detected.".into() }, previous_stops })
+}
+
+#[tauri::command]
+fn stop_risk(pid: u32, history: State<StopHistoryState>) -> Result<StopRisk, String> { stop_risk_for_pid(pid, &history) }
+
+fn record_stop(pid: u32, history: &StopHistoryState) { let executable = executable_for(pid).unwrap_or_else(|| command_for(pid)); if let Ok(mut values) = history.0.lock() { *values.entry(executable).or_default() += 1; } }
 
 fn binary_trust(path: &str) -> BinaryTrust {
   let cache = BINARY_TRUST_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -263,15 +300,15 @@ fn kill_frontmost_process(app: &AppHandle) {
 fn list_listeners() -> Result<Vec<Listener>, String> { scan_listeners() }
 
 #[tauri::command]
-fn stop_listener(pid: u32) -> Result<StopResult, String> {
-  owned_process(pid)?; signal(pid, "-TERM")?;
-  for _ in 0..50 { if !process_exists(pid) { return Ok(StopResult { stopped: true, requires_force: false, message: "Server stopped gracefully.".into() }); } thread::sleep(Duration::from_millis(100)); }
+fn stop_listener(pid: u32, history: State<StopHistoryState>) -> Result<StopResult, String> {
+  owned_process(pid)?; let risk = stop_risk_for_pid(pid, &history)?; if risk.blocked { return Err(risk.consequence); } signal(pid, "-TERM")?;
+  for _ in 0..50 { if !process_exists(pid) { record_stop(pid, &history); return Ok(StopResult { stopped: true, requires_force: false, message: "Server stopped gracefully.".into() }); } thread::sleep(Duration::from_millis(100)); }
   Ok(StopResult { stopped: false, requires_force: true, message: "The server is still running. You may Force Stop it.".into() })
 }
 
 #[tauri::command]
-fn force_stop_listener(pid: u32) -> Result<StopResult, String> {
-  owned_process(pid)?; signal(pid, "-KILL")?;
+fn force_stop_listener(pid: u32, history: State<StopHistoryState>) -> Result<StopResult, String> {
+  owned_process(pid)?; let risk = stop_risk_for_pid(pid, &history)?; if risk.blocked { return Err(risk.consequence); } signal(pid, "-KILL")?; record_stop(pid, &history);
   Ok(StopResult { stopped: true, requires_force: false, message: "Server force-stopped.".into() })
 }
 
@@ -403,7 +440,7 @@ fn start_watcher(app: AppHandle) {
 pub fn run() {
   let show_portman = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyP);
   let kill_frontmost = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT | Modifiers::SHIFT), Code::KeyK);
-  tauri::Builder::default().manage(MetricsState(Mutex::new(System::new()))).plugin(tauri_plugin_opener::init()).setup(move |app| {
+  tauri::Builder::default().manage(MetricsState(Mutex::new(System::new()))).manage(StopHistoryState(Mutex::new(HashMap::new()))).plugin(tauri_plugin_opener::init()).setup(move |app| {
     let show_portman = show_portman; let kill_frontmost = kill_frontmost;
     app.handle().plugin(tauri_plugin_global_shortcut::Builder::new().with_handler(move |app, shortcut, event| {
       if event.state() != ShortcutState::Pressed { return; }
@@ -415,7 +452,7 @@ pub fn run() {
     app.global_shortcut().register(kill_frontmost)?;
     start_watcher(app.handle().clone()); Ok(())
   })
-    .invoke_handler(tauri::generate_handler![list_listeners, stop_listener, force_stop_listener, process_metrics, process_threads, inspect_executable, instance_anomalies, outbound_connections, open_listener, process_sandbox_status])
+    .invoke_handler(tauri::generate_handler![list_listeners, stop_listener, force_stop_listener, stop_risk, process_metrics, process_threads, inspect_executable, instance_anomalies, outbound_connections, open_listener, process_sandbox_status])
     .run(tauri::generate_context!()).expect("error while running PortMan");
 }
 

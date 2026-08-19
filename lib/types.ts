@@ -31,6 +31,8 @@ export type InstanceAnomaly = { pid: number; score: number; baselineSamples: num
 export type StopRisk = { level: "low" | "medium" | "critical"; score: number; blocked: boolean; reasons: string[]; consequence: string; previousStops: number };
 export type MemoryGuardStatus = { enabled: boolean; thresholdPercent: number };
 export type MemoryGuardAlert = { pid: number; processName: string; memoryBytes: number; totalMemoryBytes: number; utilizationPercent: number };
+export type ExecutionWatcherStatus = { enabled: boolean; autoPause: boolean; platformMode: string };
+export type QuarantineEntry = { id: number; pid: number; processName: string; path: string; sha256: string; reasons: string[]; detectedAt: number; state: "detected" | "paused" | "resumed"; canResume: boolean };
 
 export type GeoLocation = { city: string; country: string; latitude: number; longitude: number };
 export type RemoteConnection = { remoteIp: string; remotePort: number; location: GeoLocation | null };

@@ -5,7 +5,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import * as ContextMenu from "@radix-ui/react-context-menu";
 import { Activity, ArrowUpDown, ChevronDown, CircleStop, Copy, ExternalLink, Globe2, Grid2X2, List, Loader2, LockKeyhole, RefreshCw, Search, Server, ShieldAlert, ShieldCheck, TerminalSquare, X } from "lucide-react";
-import type { BinaryTrust, ExecutableInspection, InstanceAnomaly, Listener, MemoryGuardAlert, MemoryGuardStatus, ProcessMetrics, ProcessThread, RemoteConnection, SandboxStatus, StopRisk } from "@/lib/types";
+import type { BinaryTrust, ExecutableInspection, ExecutionWatcherStatus, InstanceAnomaly, Listener, MemoryGuardAlert, MemoryGuardStatus, ProcessMetrics, ProcessThread, QuarantineEntry, RemoteConnection, SandboxStatus, StopRisk } from "@/lib/types";
 import { filterAndSortListeners, listenerAddress } from "@/lib/listeners";
 import { portmanApi } from "@/lib/tauri";
 import { Button, Modal } from "@/components/ui";
@@ -13,6 +13,7 @@ import { Button, Modal } from "@/components/ui";
 type Filter = "all" | "localhost";
 type Sort = "port" | "name";
 type ViewMode = "list" | "grid";
+type WorkspaceTab = "listeners" | "quarantine";
 const truncate = (value: string, max = 56) => value.length > max ? `${value.slice(0, max)}…` : value;
 const statusLabel = (listener: Listener) => listener.isProtected ? "Protected" : "Running";
 const trustLabel = (trust: BinaryTrust) => ({ trusted: "Trusted binary", signed: "Signed but untrusted binary", unsigned: "Unsigned binary", unknown: "Signature unavailable" })[trust];
@@ -41,6 +42,9 @@ export function PortMan() {
   const [anomalies, setAnomalies] = useState<Record<number, InstanceAnomaly>>({});
   const [memoryGuard, setMemoryGuard] = useState<MemoryGuardStatus | null>(null);
   const [memoryAlert, setMemoryAlert] = useState<MemoryGuardAlert | null>(null);
+  const [watcher, setWatcher] = useState<ExecutionWatcherStatus | null>(null);
+  const [quarantine, setQuarantine] = useState<QuarantineEntry[]>([]);
+  const [workspaceTab, setWorkspaceTab] = useState<WorkspaceTab>("listeners");
 
   const refresh = useCallback(async () => {
     setError("");
@@ -52,6 +56,7 @@ export function PortMan() {
   useEffect(() => { refresh(); }, [refresh]);
   useEffect(() => { portmanApi.sandboxStatus().then(setSandboxStatus).catch(() => setSandboxStatus(null)); }, []);
   useEffect(() => { portmanApi.memoryGuard().then(setMemoryGuard).catch(() => setMemoryGuard(null)); }, []);
+  useEffect(() => { portmanApi.executionWatcher().then(setWatcher).catch(() => setWatcher(null)); portmanApi.quarantined().then(setQuarantine).catch(() => setQuarantine([])); }, []);
   useEffect(() => {
     if (!("__TAURI_INTERNALS__" in window)) return;
     let unlisten: (() => void) | undefined;
@@ -66,6 +71,7 @@ export function PortMan() {
     return () => { unlistenScan?.(); unlistenAction?.(); };
   }, [refresh]);
   useEffect(() => { if (!("__TAURI_INTERNALS__" in window)) return; let unlisten: (() => void) | undefined; listen<MemoryGuardAlert>("memory-guard-alert", (event) => setMemoryAlert(event.payload)).then((fn) => { unlisten = fn; }); return () => unlisten?.(); }, []);
+  useEffect(() => { if (!("__TAURI_INTERNALS__" in window)) return; let unlisten: (() => void) | undefined; listen<QuarantineEntry>("execution-quarantined", (event) => { setQuarantine((entries) => [event.payload, ...entries]); setWorkspaceTab("quarantine"); setNotice(`${event.payload.processName} was added to quarantine.`); }).then((fn) => { unlisten = fn; }); return () => unlisten?.(); }, []);
   useEffect(() => {
     if (!("__TAURI_INTERNALS__" in window)) return;
     let unlisten: (() => void) | undefined;
@@ -132,8 +138,10 @@ export function PortMan() {
     <aside className="app-sidebar">
       <div className="brand"><div className="brand-mark"><Activity size={19}/></div><div><b>PortMan</b><span>LOCAL SERVER MANAGER</span></div></div>
       <div className="sidebar-summary"><p>ACTIVE LISTENERS</p><b>{listeners.length}</b><span>{manageable} manageable by you</span></div>
+      <div className="sidebar-section"><p>WORKSPACE</p><button className={workspaceTab === "listeners" ? "sidebar-filter active" : "sidebar-filter"} onClick={() => setWorkspaceTab("listeners")}><i/>Listener inventory</button><button className={workspaceTab === "quarantine" ? "sidebar-filter active" : "sidebar-filter"} onClick={() => setWorkspaceTab("quarantine")}><ShieldAlert size={12}/>{quarantine.filter((entry) => entry.state !== "resumed").length} Quarantine</button></div>
       <div className="sidebar-section"><p>SCOPE</p><button className={filter === "all" ? "sidebar-filter active" : "sidebar-filter"} onClick={() => setFilter("all")}><i/>All interfaces</button><button className={filter === "localhost" ? "sidebar-filter active" : "sidebar-filter"} onClick={() => setFilter("localhost")}><i/>Localhost only</button></div>
       <div className="sidebar-section"><p>MEMORY GUARD</p><button className={memoryGuard?.enabled ? "sidebar-filter active" : "sidebar-filter"} onClick={() => portmanApi.setMemoryGuard(!memoryGuard?.enabled).then(setMemoryGuard)}><i/>{memoryGuard?.enabled ? "Armed at 95%" : "Enable protection"}</button></div>
+      <div className="sidebar-section"><p>EXECUTION WATCHER</p><button className={watcher?.enabled ? "sidebar-filter active" : "sidebar-filter"} onClick={() => watcher && portmanApi.setExecutionWatcher(!watcher.enabled, watcher.autoPause).then(setWatcher)}><i/>{watcher?.enabled ? "Monitoring launches" : "Enable watcher"}</button><button className={watcher?.autoPause ? "sidebar-filter active" : "sidebar-filter"} disabled={!watcher?.enabled} onClick={() => watcher && portmanApi.setExecutionWatcher(watcher.enabled, !watcher.autoPause).then(setWatcher)}><i/>{watcher?.autoPause ? "Auto-pause enabled" : "Review before pause"}</button></div>
       <div className="sidebar-spacer" />
       <div className="scanner-card"><span className="pulse"/><div><b>Scanner active</b><p>TCP · refreshes every second</p></div></div>
       {sandboxStatus && <div className={`isolation-card ${sandboxStatus.level}`} title={`${sandboxStatus.details}${sandboxStatus.indicators.length ? ` Indicators: ${sandboxStatus.indicators.join(", ")}` : ""}`}><ShieldCheck size={15}/><div><b>{sandboxStatus.environment}</b><p>Isolation: {sandboxStatus.level}</p></div></div>}
@@ -142,14 +150,14 @@ export function PortMan() {
       <div className="workspace-content">
         {error && <div className="alert alert-error"><ShieldAlert size={17}/><span>{error}</span><Button className="ml-auto" variant="ghost" onClick={refresh}>Retry</Button></div>}
         {notice && <div className="alert"><Activity size={17}/><span>{notice}</span><button className="ml-auto" onClick={() => setNotice("")}><X size={15}/></button></div>}
-        <section className={`main-panes ${selected ? "with-inspector" : ""}`}>
+        {workspaceTab === "quarantine" ? <QuarantinePanel entries={quarantine} watcher={watcher} onResume={async (pid) => { try { const result = await portmanApi.resumeQuarantined(pid); setNotice(result.message); setQuarantine((entries) => entries.map((entry) => entry.pid === pid && entry.state === "paused" ? { ...entry, state: "resumed", canResume: false } : entry)); } catch (cause) { setNotice(cause instanceof Error ? cause.message : "Could not resume the process."); } }} /> : <section className={`main-panes ${selected ? "with-inspector" : ""}`}>
           <div className="listeners-pane">
             <div className="pane-title"><div><h2>Listener inventory</h2><p>{visible.length} of {listeners.length} shown</p></div><div className="pane-actions"><div className="view-toggle"><button className={viewMode === "list" ? "selected" : ""} aria-label="List view" onClick={() => setViewMode("list")}><List size={15}/></button><button className={viewMode === "grid" ? "selected" : ""} aria-label="Grid view" onClick={() => setViewMode("grid")}><Grid2X2 size={14}/></button></div><button className="icon-button" title="Toggle sort" onClick={() => setSort(sort === "port" ? "name" : "port")}><ArrowUpDown size={16}/></button></div></div>
             {viewMode === "list" && <div className="table-head"><span>Process</span><span>PID</span><span>Port</span><span>Address</span><span>Owner</span><span>Status</span></div>}
             <div className={viewMode === "grid" ? "listener-grid" : "listener-list"}>{loading ? <Empty icon={<Loader2 className="animate-spin"/>} title="Scanning local listeners" text="This only takes a moment."/> : visible.length === 0 ? <Empty icon={<Globe2/>} title="No matching listeners" text="Adjust filters or start a local server."/> : visible.map((listener) => <ListenerMenu key={listener.id} listener={listener} onStop={setStopping}>{viewMode === "grid" ? <ListenerTile listener={listener} selected={selected?.id === listener.id} onSelect={() => setSelectedId(listener.id)} /> : <button className={`listener-row ${selected?.id === listener.id ? "selected" : ""}`} onClick={() => setSelectedId(listener.id)}><span className="process-cell"><span className="process-icon"><TerminalSquare size={15}/></span><span><b>{listener.processName}<TrustMark trust={listener.binaryTrust}/></b><small title={listener.command}>{serviceKind(listener)} · {truncate(listener.command)}</small></span></span><span className="pid-cell">{listener.pid}</span><span className="port-cell">:{listener.port}</span><span className="binding-cell" title={listenerAddress(listener)}>{listenerAddress(listener)}</span><span className="owner-cell">{listener.owner}</span><span className={listener.isProtected ? "status protected" : "status"}><i/>{statusLabel(listener)}</span></button>}</ListenerMenu>)}</div>
           </div>
           {selected && <Inspector listener={selected} metrics={metrics} history={metricHistory} connections={connections} anomaly={anomalies[selected.pid]} onClose={() => setSelectedId(null)} onStop={setStopping} />}
-        </section>
+        </section>}
       </div>
       <footer className="statusbar"><span><i className="pulse"/> Native scanner online</span><span>⌃⌥P: Show & scan</span><span>⌃⌥⇧K: Quit frontmost app</span><span>{sandboxStatus ? `Isolation: ${sandboxStatus.level}` : "Checking isolation…"}</span><span>Current user processes can be stopped</span></footer>
     </section>
@@ -160,6 +168,8 @@ export function PortMan() {
     </div>
   </main>;
 }
+
+function QuarantinePanel({ entries, watcher, onResume }: { entries: QuarantineEntry[]; watcher: ExecutionWatcherStatus | null; onResume: (pid: number) => void }) { return <section className="quarantine-pane"><div className="pane-title"><div><h2>Quarantine</h2><p>Suspicious executable launches retained for review</p></div><ShieldAlert size={19}/></div><div className="quarantine-mode"><ShieldCheck size={15}/><span>{watcher?.platformMode ?? "Loading execution watcher…"}</span></div>{entries.length === 0 ? <Empty icon={<ShieldCheck/>} title="No quarantined executions" text="New executable processes are scanned as they appear. Auto-pause is optional."/> : <div className="quarantine-list">{entries.map((entry) => <article className={`quarantine-entry ${entry.state}`} key={entry.id}><div><div className="quarantine-entry-head"><b>{entry.processName}</b><span>{entry.state}</span></div><p>PID {entry.pid} · {new Date(entry.detectedAt * 1000).toLocaleString()}</p><code title={entry.path}>{entry.path}</code><small>SHA-256 {entry.sha256}</small><ul>{entry.reasons.map((reason) => <li key={reason}>{reason}</li>)}</ul></div>{entry.canResume && <Button variant="ghost" onClick={() => onResume(entry.pid)}>Resume</Button>}</article>)}</div>}</section>; }
 
 function Empty({ icon, title, text }: { icon: React.ReactNode; title: string; text: string }) { return <div className="empty"><span>{icon}</span><b>{title}</b><p>{text}</p></div>; }
 function ExecutableModal({ inspection, error, onClose }: { inspection: ExecutableInspection | null; error: string; onClose: () => void }) { const open = !!inspection || !!error; return <Modal open={open} onOpenChange={(value) => !value && onClose()} title="Dropped executable inspection">{error ? <p className="text-sm text-rose-300">{error}</p> : inspection && <div className="executable-inspection"><p className="section-label">EXECUTABLE</p><b>{inspection.name}</b><code>{inspection.path}</code>{!inspection.isExecutable ? <p className="drop-result">This file is not marked as executable.</p> : inspection.instances.length === 0 ? <p className="drop-result">No running instance found.</p> : <><p className="drop-result">{inspection.instances.length} running {inspection.instances.length === 1 ? "instance" : "instances"} found</p>{inspection.instances.map((instance) => <div className="executable-instance" key={instance.pid}><span><b>PID {instance.pid}</b><small>{instance.state}</small></span><code>{instance.path}</code><em>{instance.ports.length ? instance.ports.map((port) => `:${port}`).join(", ") : "No listening port"}</em></div>)}</>}</div>}</Modal>; }

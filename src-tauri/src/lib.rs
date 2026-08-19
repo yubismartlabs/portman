@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
-use std::{collections::{BTreeMap, HashMap}, path::Path, process::Command, sync::{Mutex, OnceLock}, thread, time::Duration};
+use sha2::{Digest, Sha256};
+use std::{collections::{BTreeMap, BTreeSet, HashMap, HashSet}, fs::File, io::{BufReader, Read}, path::Path, process::Command, sync::{Mutex, OnceLock}, thread, time::{Duration, SystemTime, UNIX_EPOCH}};
 use sysinfo::{Pid, ProcessesToUpdate, System};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, ShortcutState};
@@ -69,10 +70,24 @@ pub struct MemoryGuardStatus { pub enabled: bool, pub threshold_percent: u8 }
 #[serde(rename_all = "camelCase")]
 pub struct MemoryGuardAlert { pub pid: u32, pub process_name: String, pub memory_bytes: u64, pub total_memory_bytes: u64, pub utilization_percent: f32 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionWatcherStatus { pub enabled: bool, pub auto_pause: bool, pub platform_mode: String }
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuarantineEntry { pub id: u64, pub pid: u32, pub process_name: String, pub path: String, pub sha256: String, pub reasons: Vec<String>, pub detected_at: u64, pub state: String, pub can_resume: bool }
+
 struct MetricsState(Mutex<System>);
 struct StopHistoryState(Mutex<HashMap<String, u32>>);
 struct MemoryGuardState(Mutex<MemoryGuardConfig>);
+struct ExecutionWatcherState(Mutex<ExecutionWatcherConfig>);
 struct MemoryGuardConfig { enabled: bool, paused_pids: std::collections::BTreeSet<u32> }
+struct ExecutionWatcherConfig { enabled: bool, auto_pause: bool, seen_pids: HashSet<u32>, quarantined: Vec<QuarantineEntry>, next_id: u64, blocked_hashes: HashSet<String> }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SignatureDatabase { blocked_sha256: Vec<String> }
 static BINARY_TRUST_CACHE: OnceLock<Mutex<HashMap<String, BinaryTrust>>> = OnceLock::new();
 static GEO_CACHE: OnceLock<Mutex<HashMap<String, Option<GeoLocation>>>> = OnceLock::new();
 static ANOMALY_CACHE: OnceLock<Mutex<HashMap<String, ProcessBaseline>>> = OnceLock::new();
@@ -456,12 +471,100 @@ fn open_listener(listener: Listener) -> Result<String, String> {
   if status.success() { Ok(url) } else { Err("macOS could not open this address.".into()) }
 }
 
+fn sha256_file(path: &Path) -> Result<String, String> {
+  let file = File::open(path).map_err(|e| format!("Could not read executable for hashing: {e}"))?;
+  let mut reader = BufReader::new(file); let mut hasher = Sha256::new(); let mut buffer = [0_u8; 64 * 1024];
+  loop { let read = reader.read(&mut buffer).map_err(|e| format!("Could not hash executable: {e}"))?; if read == 0 { break; } hasher.update(&buffer[..read]); }
+  Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn local_blocked_hashes() -> HashSet<String> {
+  serde_json::from_str::<SignatureDatabase>(include_str!("../signatures.json")).map(|database| database.blocked_sha256).unwrap_or_default().into_iter().chain(std::env::var("PORTMAN_BLOCKED_SHA256").unwrap_or_default().split(',').map(str::to_string)).map(|hash| hash.trim().to_ascii_lowercase()).filter(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())).collect()
+}
+
+fn is_untrusted_launch_location(path: &str) -> bool {
+  let normalized = path.replace('\\', "/").to_ascii_lowercase();
+  normalized.contains("/downloads/") || normalized.contains("/tmp/") || normalized.contains("/private/var/folders/") || normalized.contains("/appdata/local/temp/")
+}
+
+fn should_ignore_executable(path: &Path) -> bool {
+  let value = path.to_string_lossy();
+  value.starts_with("/System/") || value.starts_with("/usr/") || value.starts_with("/bin/") || value.starts_with("/sbin/") || value.starts_with("/Library/Apple/")
+}
+
+fn process_owned_by_current_user(pid: u32) -> bool {
+  let Ok(current) = current_uid() else { return false; };
+  Command::new("ps").args(["-p", &pid.to_string(), "-o", "uid="]).output().ok().is_some_and(|output| String::from_utf8_lossy(&output.stdout).trim() == current)
+}
+
+fn inspect_new_process(pid: u32, process_name: String, path: &Path, blocked_hashes: &HashSet<String>) -> Option<QuarantineEntry> {
+  if should_ignore_executable(path) || !path.is_file() { return None; }
+  let path_text = path.to_string_lossy().to_string(); let hash = sha256_file(path).ok()?; let mut reasons = Vec::new();
+  if blocked_hashes.contains(&hash) { reasons.push("SHA-256 matches PortMan's local blocked-signature database.".into()); }
+  let trust = binary_trust(&path_text);
+  if is_untrusted_launch_location(&path_text) && matches!(trust, BinaryTrust::Unsigned | BinaryTrust::Unknown) {
+    reasons.push("Unsigned executable launched from a temporary or Downloads location.".into());
+  }
+  let name = process_name.to_ascii_lowercase();
+  if is_untrusted_launch_location(&path_text) && matches!(trust, BinaryTrust::Unsigned | BinaryTrust::Unknown) && ["crack", "keygen", "payload", "miner"].iter().any(|word| name.contains(word)) {
+    reasons.push("Executable name matches a high-risk local rule.".into());
+  }
+  (!reasons.is_empty()).then(|| QuarantineEntry { id: 0, pid, process_name, path: path_text, sha256: hash, reasons, detected_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(), state: "detected".into(), can_resume: false })
+}
+
+fn check_execution_watcher(app: &AppHandle, initialized: &mut bool) {
+  let watcher = app.state::<ExecutionWatcherState>(); let mut system = System::new(); system.refresh_processes(ProcessesToUpdate::All, true);
+  let pids: HashSet<u32> = system.processes().keys().map(|pid| pid.as_u32()).collect();
+  let Ok(mut config) = watcher.0.lock() else { return; };
+  if !*initialized { config.seen_pids = pids; *initialized = true; return; }
+  let new_pids: Vec<u32> = pids.difference(&config.seen_pids).copied().collect(); config.seen_pids = pids;
+  if !config.enabled { return; }
+  for pid in new_pids {
+    let Some(process) = system.process(Pid::from_u32(pid)) else { continue; };
+    let Some(path) = process.exe() else { continue; };
+    let Some(mut entry) = inspect_new_process(pid, process.name().to_string_lossy().to_string(), path, &config.blocked_hashes) else { continue; };
+    entry.id = config.next_id; config.next_id += 1;
+    if config.auto_pause && process_owned_by_current_user(pid) && pid != std::process::id() {
+      if signal(pid, "-STOP").is_ok() { entry.state = "paused".into(); entry.can_resume = true; }
+    }
+    config.quarantined.push(entry.clone()); let _ = app.emit("execution-quarantined", entry);
+  }
+}
+
+#[tauri::command]
+fn execution_watcher_status(watcher: State<ExecutionWatcherState>) -> Result<ExecutionWatcherStatus, String> {
+  let config = watcher.0.lock().map_err(|_| "Execution watcher is unavailable.".to_string())?;
+  Ok(ExecutionWatcherStatus { enabled: config.enabled, auto_pause: config.auto_pause, platform_mode: if cfg!(target_os = "macos") { "Process monitoring; Endpoint Security requires a separately entitled system extension.".into() } else { "Process polling monitor".into() } })
+}
+
+#[tauri::command]
+fn set_execution_watcher(enabled: bool, auto_pause: bool, watcher: State<ExecutionWatcherState>) -> Result<ExecutionWatcherStatus, String> {
+  let mut config = watcher.0.lock().map_err(|_| "Execution watcher is unavailable.".to_string())?; config.enabled = enabled; config.auto_pause = auto_pause;
+  Ok(ExecutionWatcherStatus { enabled, auto_pause, platform_mode: if cfg!(target_os = "macos") { "Process monitoring; Endpoint Security requires a separately entitled system extension.".into() } else { "Process polling monitor".into() } })
+}
+
+#[tauri::command]
+fn quarantined_processes(watcher: State<ExecutionWatcherState>) -> Result<Vec<QuarantineEntry>, String> {
+  let config = watcher.0.lock().map_err(|_| "Quarantine is unavailable.".to_string())?; Ok(config.quarantined.clone())
+}
+
+#[tauri::command]
+fn resume_quarantined(pid: u32, watcher: State<ExecutionWatcherState>) -> Result<StopResult, String> {
+  if !process_owned_by_current_user(pid) { return Err("Only your own quarantined processes can be resumed.".into()); }
+  signal(pid, "-CONT")?;
+  let mut config = watcher.0.lock().map_err(|_| "Quarantine is unavailable.".to_string())?;
+  if let Some(entry) = config.quarantined.iter_mut().rev().find(|entry| entry.pid == pid && entry.state == "paused") { entry.state = "resumed".into(); entry.can_resume = false; }
+  Ok(StopResult { stopped: false, requires_force: false, message: "Quarantined process resumed.".into() })
+}
+
 fn start_watcher(app: AppHandle) {
   std::thread::spawn(move || {
     let mut last: Vec<Listener> = Vec::new();
+    let mut execution_watcher_initialized = false;
     loop {
       if let Ok(next) = scan_listeners() { if next != last { let _ = app.emit("server-list-updated", &next); last = next; } }
       check_memory_guard(&app);
+      check_execution_watcher(&app, &mut execution_watcher_initialized);
       thread::sleep(Duration::from_secs(1));
     }
   });
@@ -470,7 +573,8 @@ fn start_watcher(app: AppHandle) {
 pub fn run() {
   let show_portman = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyP);
   let kill_frontmost = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT | Modifiers::SHIFT), Code::KeyK);
-  tauri::Builder::default().manage(MetricsState(Mutex::new(System::new()))).manage(StopHistoryState(Mutex::new(HashMap::new()))).manage(MemoryGuardState(Mutex::new(MemoryGuardConfig { enabled: false, paused_pids: std::collections::BTreeSet::new() }))).plugin(tauri_plugin_opener::init()).setup(move |app| {
+  let blocked_hashes = local_blocked_hashes();
+  tauri::Builder::default().manage(MetricsState(Mutex::new(System::new()))).manage(StopHistoryState(Mutex::new(HashMap::new()))).manage(MemoryGuardState(Mutex::new(MemoryGuardConfig { enabled: false, paused_pids: BTreeSet::new() }))).manage(ExecutionWatcherState(Mutex::new(ExecutionWatcherConfig { enabled: true, auto_pause: false, seen_pids: HashSet::new(), quarantined: Vec::new(), next_id: 1, blocked_hashes }))).plugin(tauri_plugin_opener::init()).setup(move |app| {
     let show_portman = show_portman; let kill_frontmost = kill_frontmost;
     app.handle().plugin(tauri_plugin_global_shortcut::Builder::new().with_handler(move |app, shortcut, event| {
       if event.state() != ShortcutState::Pressed { return; }
@@ -482,7 +586,7 @@ pub fn run() {
     app.global_shortcut().register(kill_frontmost)?;
     start_watcher(app.handle().clone()); Ok(())
   })
-    .invoke_handler(tauri::generate_handler![list_listeners, stop_listener, force_stop_listener, resume_listener, stop_risk, memory_guard_status, set_memory_guard, process_metrics, process_threads, inspect_executable, instance_anomalies, outbound_connections, open_listener, process_sandbox_status])
+    .invoke_handler(tauri::generate_handler![list_listeners, stop_listener, force_stop_listener, resume_listener, stop_risk, memory_guard_status, set_memory_guard, execution_watcher_status, set_execution_watcher, quarantined_processes, resume_quarantined, process_metrics, process_threads, inspect_executable, instance_anomalies, outbound_connections, open_listener, process_sandbox_status])
     .run(tauri::generate_context!()).expect("error while running PortMan");
 }
 
@@ -499,4 +603,5 @@ mod tests {
     let threads = parse_process_threads("101 0.2 worker\n99 12.5 server main\n");
     assert_eq!(threads, vec![ProcessThread { id: 99, name: "server main".into(), cpu_percent: 12.5 }, ProcessThread { id: 101, name: "worker".into(), cpu_percent: 0.2 }]);
   }
+  #[test] fn identifies_untrusted_launch_locations() { assert!(is_untrusted_launch_location("/Users/test/Downloads/tool")); assert!(is_untrusted_launch_location("C:\\Users\\test\\AppData\\Local\\Temp\\tool.exe")); assert!(!is_untrusted_launch_location("/Applications/Safari.app")); }
 }

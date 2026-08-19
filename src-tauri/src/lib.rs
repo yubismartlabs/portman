@@ -13,8 +13,13 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use sysinfo::{Pid, ProcessesToUpdate, System};
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{
+    menu::{Menu, MenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    AppHandle, Emitter, Manager, State,
+};
 use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, ShortcutState};
+use tauri_plugin_notification::NotificationExt;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -771,6 +776,44 @@ fn focus_and_scan(app: &AppHandle) {
     let _ = app.emit("shortcut-scan", ());
 }
 
+fn notify(app: &AppHandle, title: &str, body: String) {
+    let _ = app.notification().builder().title(title).body(&body).show();
+}
+
+fn configure_menu_bar(app: &tauri::App) -> tauri::Result<()> {
+    let show = MenuItem::with_id(app, "show", "Show PortMan", true, None::<&str>)?;
+    let scan = MenuItem::with_id(app, "scan", "Refresh listeners", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit PortMan", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &scan, &quit])?;
+    let icon = app
+        .default_window_icon()
+        .cloned()
+        .ok_or_else(|| tauri::Error::AssetNotFound("application icon".into()))?;
+
+    TrayIconBuilder::with_id("portman-menu-bar")
+        .icon(icon)
+        .tooltip("PortMan — monitoring local services")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "show" | "scan" => focus_and_scan(app),
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                focus_and_scan(tray.app_handle());
+            }
+        })
+        .build(app)?;
+    Ok(())
+}
+
 fn kill_frontmost_process(app: &AppHandle) {
     let result = frontmost_process_id().and_then(|pid| {
         if pid == std::process::id() {
@@ -926,6 +969,16 @@ fn check_memory_guard(app: &AppHandle) {
                     total_memory_bytes: total,
                     utilization_percent: used as f32 / total as f32 * 100.0,
                 },
+            );
+            notify(
+                app,
+                "Memory guard paused a service",
+                format!(
+                    "{} (PID {}) was paused because system memory reached {:.0}%.",
+                    listener.process_name,
+                    listener.pid,
+                    used as f32 / total as f32 * 100.0
+                ),
             );
         }
     }
@@ -1630,6 +1683,15 @@ fn check_execution_watcher(app: &AppHandle, initialized: &mut bool) {
         }
         config.quarantined.push(entry.clone());
         let _ = app.emit("execution-quarantined", entry);
+        let notification = config.quarantined.last().expect("entry was just pushed");
+        notify(
+            app,
+            "Suspicious process detected",
+            format!(
+                "{} (PID {}) was {}. Open PortMan to review it.",
+                notification.process_name, notification.pid, notification.state
+            ),
+        );
     }
 }
 
@@ -1771,6 +1833,7 @@ pub fn run() {
     let blocked_hashes = local_blocked_hashes();
     tauri::Builder::default()
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(MetricsState(Mutex::new(System::new())))
         .manage(StopHistoryState(Mutex::new(HashMap::new())))
@@ -1807,6 +1870,7 @@ pub fn run() {
             use tauri_plugin_global_shortcut::GlobalShortcutExt;
             app.global_shortcut().register(show_portman)?;
             app.global_shortcut().register(kill_frontmost)?;
+            configure_menu_bar(app)?;
             start_watcher(app.handle().clone());
             Ok(())
         })

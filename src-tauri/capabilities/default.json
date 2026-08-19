@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "PortMan desktop capabilities",
   "windows": ["main"],
-  "permissions": ["core:default", "core:window:allow-start-dragging", "process:default", "updater:default"]
+  "permissions": ["core:default", "core:window:allow-start-dragging", "process:default", "updater:default", "notification:default"]
 }

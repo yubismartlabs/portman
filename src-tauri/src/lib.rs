@@ -39,6 +39,10 @@ pub struct ProcessMetrics {
   pub write_bytes_per_sec: u64,
 }
 
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessThread { pub id: u32, pub name: String, pub cpu_percent: f32 }
+
 struct MetricsState(Mutex<System>);
 static BINARY_TRUST_CACHE: OnceLock<Mutex<HashMap<String, BinaryTrust>>> = OnceLock::new();
 static GEO_CACHE: OnceLock<Mutex<HashMap<String, Option<GeoLocation>>>> = OnceLock::new();
@@ -202,6 +206,29 @@ fn process_metrics(pid: u32, state: State<MetricsState>) -> Result<ProcessMetric
   })
 }
 
+fn parse_process_threads(raw: &str) -> Vec<ProcessThread> {
+  let mut threads: Vec<ProcessThread> = raw.lines().filter_map(|line| {
+    let mut fields = line.split_whitespace();
+    let id = fields.next()?.parse().ok()?;
+    let cpu_percent = fields.next()?.parse().ok()?;
+    let name = fields.collect::<Vec<_>>().join(" ");
+    Some(ProcessThread { id, cpu_percent, name: if name.is_empty() { "Thread".into() } else { name } })
+  }).collect();
+  threads.sort_by(|a, b| b.cpu_percent.total_cmp(&a.cpu_percent).then_with(|| a.id.cmp(&b.id)));
+  threads
+}
+
+#[tauri::command]
+fn process_threads(pid: u32) -> Result<Vec<ProcessThread>, String> {
+  #[cfg(target_os = "macos")]
+  let args = ["-M", "-p", &pid.to_string(), "-o", "tid=,pcpu=,comm="];
+  #[cfg(not(target_os = "macos"))]
+  let args = ["-L", "-p", &pid.to_string(), "-o", "lwp=,pcpu=,comm="];
+  let output = Command::new("ps").args(args).output().map_err(|e| format!("Could not inspect process threads: {e}"))?;
+  if !output.status.success() { return Err("The process is no longer running or its threads cannot be inspected.".into()); }
+  Ok(parse_process_threads(&String::from_utf8_lossy(&output.stdout)))
+}
+
 fn parse_socket(value: &str) -> Option<(String, u16)> {
   let endpoint = value.trim().trim_matches(['[', ']']);
   let separator = endpoint.rfind(':')?;
@@ -258,7 +285,7 @@ fn start_watcher(app: AppHandle) {
 
 pub fn run() {
   tauri::Builder::default().manage(MetricsState(Mutex::new(System::new()))).plugin(tauri_plugin_opener::init()).setup(|app| { start_watcher(app.handle().clone()); Ok(()) })
-    .invoke_handler(tauri::generate_handler![list_listeners, stop_listener, force_stop_listener, process_metrics, outbound_connections, open_listener, process_sandbox_status])
+    .invoke_handler(tauri::generate_handler![list_listeners, stop_listener, force_stop_listener, process_metrics, process_threads, outbound_connections, open_listener, process_sandbox_status])
     .run(tauri::generate_context!()).expect("error while running PortMan");
 }
 
@@ -271,4 +298,8 @@ mod tests {
     assert_eq!(listeners.len(), 2); assert_eq!(listeners[0].bindings.len(), 2); assert!(listeners[0].can_stop); assert!(listeners[1].is_protected); assert_eq!(listeners[0].binary_trust, BinaryTrust::Unknown);
   }
   #[test] fn recognizes_local_bindings() { assert_eq!(parse_binding("[::1]:8080"), Some(("::1".into(), 8080))); }
+  #[test] fn parses_threads_and_sorts_by_cpu() {
+    let threads = parse_process_threads("101 0.2 worker\n99 12.5 server main\n");
+    assert_eq!(threads, vec![ProcessThread { id: 99, name: "server main".into(), cpu_percent: 12.5 }, ProcessThread { id: 101, name: "worker".into(), cpu_percent: 0.2 }]);
+  }
 }

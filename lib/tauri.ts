@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Listener, ProcessMetrics, RemoteConnection, SandboxStatus, StopResult } from "./types";
+import type { Listener, ProcessMetrics, ProcessThread, RemoteConnection, SandboxStatus, StopResult } from "./types";
 
 const inTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
@@ -8,6 +8,7 @@ export const portmanApi = {
   stop: (pid: number) => invoke<StopResult>("stop_listener", { pid }),
   forceStop: (pid: number) => invoke<StopResult>("force_stop_listener", { pid }),
   metrics: (pid: number) => invoke<ProcessMetrics>("process_metrics", { pid }),
+  threads: (pid: number) => inTauri() ? invoke<ProcessThread[]>("process_threads", { pid }) : Promise.resolve<ProcessThread[]>([]),
   outboundConnections: (pid: number) => invoke<RemoteConnection[]>("outbound_connections", { pid }),
   sandboxStatus: () => inTauri()
     ? invoke<SandboxStatus>("process_sandbox_status")

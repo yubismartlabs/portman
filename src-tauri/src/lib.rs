@@ -78,6 +78,14 @@ pub struct ExecutionWatcherStatus { pub enabled: bool, pub auto_pause: bool, pub
 #[serde(rename_all = "camelCase")]
 pub struct QuarantineEntry { pub id: u64, pub pid: u32, pub process_name: String, pub path: String, pub sha256: String, pub reasons: Vec<String>, pub detected_at: u64, pub state: String, pub can_resume: bool }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostureCheck { pub id: String, pub title: String, pub status: String, pub summary: String, pub remediation: String, pub can_fix: bool }
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemPosture { pub score: u8, pub platform: String, pub checks: Vec<PostureCheck> }
+
 struct MetricsState(Mutex<System>);
 struct StopHistoryState(Mutex<HashMap<String, u32>>);
 struct MemoryGuardState(Mutex<MemoryGuardConfig>);
@@ -482,6 +490,42 @@ fn local_blocked_hashes() -> HashSet<String> {
   serde_json::from_str::<SignatureDatabase>(include_str!("../signatures.json")).map(|database| database.blocked_sha256).unwrap_or_default().into_iter().chain(std::env::var("PORTMAN_BLOCKED_SHA256").unwrap_or_default().split(',').map(str::to_string)).map(|hash| hash.trim().to_ascii_lowercase()).filter(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())).collect()
 }
 
+fn command_text(program: &str, args: &[&str]) -> Option<String> { Command::new(program).args(args).output().ok().filter(|output| output.status.success()).map(|output| format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr)).to_ascii_lowercase()) }
+fn posture_check(id: &str, title: &str, status: &str, summary: &str, remediation: &str, can_fix: bool) -> PostureCheck { PostureCheck { id: id.into(), title: title.into(), status: status.into(), summary: summary.into(), remediation: remediation.into(), can_fix } }
+
+#[cfg(target_os = "macos")]
+fn macos_posture() -> SystemPosture {
+  let sip = command_text("/usr/bin/csrutil", &["status"]); let gatekeeper = command_text("/usr/sbin/spctl", &["--status"]); let firewall = command_text("/usr/libexec/ApplicationFirewall/socketfilterfw", &["--getglobalstate"]); let filevault = command_text("/usr/bin/fdesetup", &["status"]);
+  let ssh_wide_open = scan_listeners().ok().is_some_and(|listeners| listeners.iter().any(|listener| listener.port == 22 && listener.bindings.iter().any(|binding| !binding.is_localhost)));
+  let checks = vec![
+    posture_check("sip", "System Integrity Protection", if sip.as_deref().is_some_and(|value| value.contains("enabled")) { "pass" } else if sip.is_some() { "fail" } else { "unknown" }, if sip.as_deref().is_some_and(|value| value.contains("enabled")) { "SIP is enabled." } else { "SIP could not be confirmed as enabled." }, "Enable SIP from macOS Recovery if it is disabled.", false),
+    posture_check("gatekeeper", "Gatekeeper", if gatekeeper.as_deref().is_some_and(|value| value.contains("assessments enabled")) { "pass" } else if gatekeeper.is_some() { "fail" } else { "unknown" }, if gatekeeper.as_deref().is_some_and(|value| value.contains("assessments enabled")) { "App assessment is enabled." } else { "App assessment is disabled or unavailable." }, "Enable Gatekeeper to assess downloaded applications.", true),
+    posture_check("firewall", "Application Firewall", if firewall.as_deref().is_some_and(|value| value.contains("enabled")) { "pass" } else if firewall.is_some() { "fail" } else { "unknown" }, if firewall.as_deref().is_some_and(|value| value.contains("enabled")) { "The macOS application firewall is enabled." } else { "The macOS application firewall is disabled or unavailable." }, "Enable the application firewall.", true),
+    posture_check("ssh", "Remote SSH exposure", if ssh_wide_open { "warning" } else { "pass" }, if ssh_wide_open { "SSH is listening beyond localhost." } else { "No externally bound SSH listener was detected." }, "Restrict SSH to localhost or a trusted network before exposing it.", false),
+    posture_check("filevault", "FileVault", if filevault.as_deref().is_some_and(|value| value.contains("filevault is on")) { "pass" } else if filevault.is_some() { "warning" } else { "unknown" }, if filevault.as_deref().is_some_and(|value| value.contains("filevault is on")) { "Startup disk encryption is enabled." } else { "Startup disk encryption is not confirmed." }, "Enable FileVault in System Settings > Privacy & Security.", false),
+  ];
+  let score = checks.iter().fold(100_i16, |score, check| score - match check.status.as_str() { "fail" => 25, "warning" => 10, _ => 0 }).clamp(0, 100) as u8;
+  SystemPosture { score, platform: "macOS".into(), checks }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_posture() -> SystemPosture { SystemPosture { score: 0, platform: std::env::consts::OS.into(), checks: vec![posture_check("platform", "System posture", "unknown", "This platform's native posture checks are not included in this build.", "Use the platform security center to review host protections.", false)] } }
+
+#[tauri::command]
+fn system_posture() -> SystemPosture { macos_posture() }
+
+#[tauri::command]
+fn apply_posture_fix(id: String) -> Result<String, String> {
+  #[cfg(target_os = "macos")]
+  {
+    let command = match id.as_str() { "firewall" => "/usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate on", "gatekeeper" => "/usr/sbin/spctl --master-enable", _ => return Err("That posture item cannot be changed automatically. Review its guidance instead.".into()) };
+    let script = format!("do shell script \"{command}\" with administrator privileges"); let output = Command::new("/usr/bin/osascript").args(["-e", &script]).output().map_err(|error| format!("Could not request administrator authorization: {error}"))?;
+    if output.status.success() { Ok("Protection setting updated.".into()) } else { Err("The protection setting was not changed. Administrator authorization may have been cancelled.".into()) }
+  }
+  #[cfg(not(target_os = "macos"))]
+  { let _ = id; Err("Automatic posture remediation is not available on this platform yet.".into()) }
+}
+
 fn is_untrusted_launch_location(path: &str) -> bool {
   let normalized = path.replace('\\', "/").to_ascii_lowercase();
   normalized.contains("/downloads/") || normalized.contains("/tmp/") || normalized.contains("/private/var/folders/") || normalized.contains("/appdata/local/temp/")
@@ -586,7 +630,7 @@ pub fn run() {
     app.global_shortcut().register(kill_frontmost)?;
     start_watcher(app.handle().clone()); Ok(())
   })
-    .invoke_handler(tauri::generate_handler![list_listeners, stop_listener, force_stop_listener, resume_listener, stop_risk, memory_guard_status, set_memory_guard, execution_watcher_status, set_execution_watcher, quarantined_processes, resume_quarantined, process_metrics, process_threads, inspect_executable, instance_anomalies, outbound_connections, open_listener, process_sandbox_status])
+    .invoke_handler(tauri::generate_handler![list_listeners, stop_listener, force_stop_listener, resume_listener, stop_risk, memory_guard_status, set_memory_guard, system_posture, apply_posture_fix, execution_watcher_status, set_execution_watcher, quarantined_processes, resume_quarantined, process_metrics, process_threads, inspect_executable, instance_anomalies, outbound_connections, open_listener, process_sandbox_status])
     .run(tauri::generate_context!()).expect("error while running PortMan");
 }
 

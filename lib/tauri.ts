@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { ExecutableInspection, ExecutionWatcherStatus, InstanceAnomaly, Listener, MemoryGuardStatus, ProcessMetrics, ProcessThread, QuarantineEntry, RemoteConnection, SandboxStatus, StopResult, StopRisk } from "./types";
+import type { ExecutableInspection, ExecutionWatcherStatus, InstanceAnomaly, Listener, MemoryGuardStatus, ProcessMetrics, ProcessThread, QuarantineEntry, RemoteConnection, SandboxStatus, StopResult, StopRisk, SystemPosture } from "./types";
 
 const inTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
@@ -18,6 +18,8 @@ export const portmanApi = {
   setExecutionWatcher: (enabled: boolean, autoPause: boolean) => invoke<ExecutionWatcherStatus>("set_execution_watcher", { enabled, autoPause }),
   quarantined: () => inTauri() ? invoke<QuarantineEntry[]>("quarantined_processes") : Promise.resolve<QuarantineEntry[]>([]),
   resumeQuarantined: (pid: number) => invoke<StopResult>("resume_quarantined", { pid }),
+  posture: () => inTauri() ? invoke<SystemPosture>("system_posture") : Promise.resolve<SystemPosture>({ score: 0, platform: "Browser preview", checks: [] }),
+  applyPostureFix: (id: string) => invoke<string>("apply_posture_fix", { id }),
   resume: (pid: number) => invoke<StopResult>("resume_listener", { pid }),
   outboundConnections: (pid: number) => invoke<RemoteConnection[]>("outbound_connections", { pid }),
   sandboxStatus: () => inTauri()

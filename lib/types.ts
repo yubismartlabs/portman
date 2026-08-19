@@ -33,6 +33,9 @@ export type MemoryGuardStatus = { enabled: boolean; thresholdPercent: number };
 export type MemoryGuardAlert = { pid: number; processName: string; memoryBytes: number; totalMemoryBytes: number; utilizationPercent: number };
 export type ExecutionWatcherStatus = { enabled: boolean; autoPause: boolean; platformMode: string };
 export type QuarantineEntry = { id: number; pid: number; processName: string; path: string; sha256: string; reasons: string[]; detectedAt: number; state: "detected" | "paused" | "resumed"; canResume: boolean };
+export type PostureStatus = "pass" | "warning" | "fail" | "unknown";
+export type PostureCheck = { id: string; title: string; status: PostureStatus; summary: string; remediation: string; canFix: boolean };
+export type SystemPosture = { score: number; platform: string; checks: PostureCheck[] };
 
 export type GeoLocation = { city: string; country: string; latitude: number; longitude: number };
 export type RemoteConnection = { remoteIp: string; remotePort: number; location: GeoLocation | null };

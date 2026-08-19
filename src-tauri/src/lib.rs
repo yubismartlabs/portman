@@ -3,6 +3,8 @@ use std::{collections::{BTreeMap, HashMap}, path::Path, process::Command, sync::
 use sysinfo::{Pid, ProcessesToUpdate, System};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, ShortcutState};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -44,6 +46,14 @@ pub struct ProcessMetrics {
 #[serde(rename_all = "camelCase")]
 pub struct ProcessThread { pub id: u32, pub name: String, pub cpu_percent: f32 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutableInstance { pub pid: u32, pub path: String, pub state: String, pub ports: Vec<u16> }
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutableInspection { pub name: String, pub path: String, pub is_executable: bool, pub instances: Vec<ExecutableInstance> }
+
 struct MetricsState(Mutex<System>);
 static BINARY_TRUST_CACHE: OnceLock<Mutex<HashMap<String, BinaryTrust>>> = OnceLock::new();
 static GEO_CACHE: OnceLock<Mutex<HashMap<String, Option<GeoLocation>>>> = OnceLock::new();
@@ -75,6 +85,39 @@ fn command_for(pid: u32) -> String {
   Command::new("ps").args(["-p", &pid.to_string(), "-o", "command="]).output()
     .ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).filter(|s| !s.is_empty()).unwrap_or_else(|| "Command unavailable".to_string())
 }
+
+fn process_state(state: &str) -> String {
+  match state.chars().next() { Some('R') => "Running", Some('S') | Some('I') => "Sleeping", Some('T') => "Stopped", Some('U') => "Uninterruptible wait", Some('Z') => "Zombie", _ => "Unknown" }.into()
+}
+
+fn inspect_executable_path(path: &str) -> Result<ExecutableInspection, String> {
+  let input = Path::new(path);
+  let metadata = input.metadata().map_err(|_| "The dropped file is no longer available.".to_string())?;
+  let canonical = input.canonicalize().map_err(|_| "Could not resolve the dropped file path.".to_string())?;
+  #[cfg(unix)]
+  let is_executable = metadata.is_file() && (metadata.permissions().mode() & 0o111 != 0);
+  #[cfg(not(unix))]
+  let is_executable = metadata.is_file();
+  let target = canonical.to_string_lossy().to_string();
+  if !is_executable { return Ok(ExecutableInspection { name: canonical.file_name().and_then(|value| value.to_str()).unwrap_or("Dropped file").into(), path: target, is_executable, instances: Vec::new() }); }
+  let listeners = scan_listeners().unwrap_or_default();
+  let output = Command::new("ps").args(["-axo", "pid=,state=,comm="]).output().map_err(|e| format!("Could not inspect running processes: {e}"))?;
+  let mut instances = Vec::new();
+  for line in String::from_utf8_lossy(&output.stdout).lines() {
+    let mut fields = line.split_whitespace();
+    let Some(pid) = fields.next().and_then(|value| value.parse::<u32>().ok()) else { continue; };
+    let state = fields.next().unwrap_or_default();
+    let process_path = fields.collect::<Vec<_>>().join(" ");
+    if process_path.is_empty() { continue; }
+    let matches = Path::new(&process_path).canonicalize().ok().is_some_and(|value| value == canonical);
+    if matches { let mut ports: Vec<u16> = listeners.iter().filter(|listener| listener.pid == pid).map(|listener| listener.port).collect(); ports.sort_unstable(); ports.dedup(); instances.push(ExecutableInstance { pid, path: process_path, state: process_state(state), ports }); }
+  }
+  instances.sort_by_key(|instance| instance.pid);
+  Ok(ExecutableInspection { name: canonical.file_name().and_then(|value| value.to_str()).unwrap_or("Executable").into(), path: target, is_executable, instances })
+}
+
+#[tauri::command]
+fn inspect_executable(path: String) -> Result<ExecutableInspection, String> { inspect_executable_path(&path) }
 
 fn executable_for(pid: u32) -> Option<String> {
   let output = Command::new("ps").args(["-p", &pid.to_string(), "-o", "comm="]).output().ok()?;
@@ -323,7 +366,7 @@ pub fn run() {
     app.global_shortcut().register(kill_frontmost)?;
     start_watcher(app.handle().clone()); Ok(())
   })
-    .invoke_handler(tauri::generate_handler![list_listeners, stop_listener, force_stop_listener, process_metrics, process_threads, outbound_connections, open_listener, process_sandbox_status])
+    .invoke_handler(tauri::generate_handler![list_listeners, stop_listener, force_stop_listener, process_metrics, process_threads, inspect_executable, outbound_connections, open_listener, process_sandbox_status])
     .run(tauri::generate_context!()).expect("error while running PortMan");
 }
 

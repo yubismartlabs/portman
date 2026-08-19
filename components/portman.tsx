@@ -2,9 +2,10 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import * as ContextMenu from "@radix-ui/react-context-menu";
 import { Activity, ArrowUpDown, ChevronDown, CircleStop, Copy, ExternalLink, Globe2, Grid2X2, List, Loader2, LockKeyhole, RefreshCw, Search, Server, ShieldAlert, ShieldCheck, TerminalSquare, X } from "lucide-react";
-import type { BinaryTrust, Listener, ProcessMetrics, ProcessThread, RemoteConnection, SandboxStatus } from "@/lib/types";
+import type { BinaryTrust, ExecutableInspection, Listener, ProcessMetrics, ProcessThread, RemoteConnection, SandboxStatus } from "@/lib/types";
 import { filterAndSortListeners, listenerAddress } from "@/lib/listeners";
 import { portmanApi } from "@/lib/tauri";
 import { Button, Modal } from "@/components/ui";
@@ -35,6 +36,8 @@ export function PortMan() {
   const [metricHistory, setMetricHistory] = useState<ProcessMetrics[]>([]);
   const [connections, setConnections] = useState<RemoteConnection[]>([]);
   const [sandboxStatus, setSandboxStatus] = useState<SandboxStatus | null>(null);
+  const [droppedExecutable, setDroppedExecutable] = useState<ExecutableInspection | null>(null);
+  const [dropError, setDropError] = useState("");
 
   const refresh = useCallback(async () => {
     setError("");
@@ -58,6 +61,18 @@ export function PortMan() {
     listen<string>("shortcut-action", (event) => { setNotice(event.payload); refresh(); }).then((fn) => { unlistenAction = fn; });
     return () => { unlistenScan?.(); unlistenAction?.(); };
   }, [refresh]);
+  useEffect(() => {
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    let unlisten: (() => void) | undefined;
+    getCurrentWebview().onDragDropEvent((event) => {
+      if (event.payload.type !== "drop") return;
+      const [path] = event.payload.paths;
+      if (!path) return;
+      setDropError("");
+      portmanApi.inspectExecutable(path).then(setDroppedExecutable).catch((cause) => setDropError(cause instanceof Error ? cause.message : "Could not inspect the dropped file."));
+    }).then((fn) => { unlisten = fn; });
+    return () => unlisten?.();
+  }, []);
 
   const visible = useMemo(() => filterAndSortListeners(listeners, query, filter, sort), [listeners, query, filter, sort]);
   const selected = listeners.find((listener) => listener.id === selectedId) ?? null;
@@ -126,11 +141,13 @@ export function PortMan() {
     </section>
     <Confirm listener={stopping} ports={listeners.filter((item) => item.pid === stopping?.pid).map((item) => item.port)} force={false} busy={busy} onClose={() => setStopping(null)} onConfirm={() => stopping && terminate(stopping)} />
     <Confirm listener={force} ports={listeners.filter((item) => item.pid === force?.pid).map((item) => item.port)} force busy={busy} onClose={() => setForce(null)} onConfirm={() => force && terminate(force, true)} />
+    <ExecutableModal inspection={droppedExecutable} error={dropError} onClose={() => { setDroppedExecutable(null); setDropError(""); }} />
     </div>
   </main>;
 }
 
 function Empty({ icon, title, text }: { icon: React.ReactNode; title: string; text: string }) { return <div className="empty"><span>{icon}</span><b>{title}</b><p>{text}</p></div>; }
+function ExecutableModal({ inspection, error, onClose }: { inspection: ExecutableInspection | null; error: string; onClose: () => void }) { const open = !!inspection || !!error; return <Modal open={open} onOpenChange={(value) => !value && onClose()} title="Dropped executable inspection">{error ? <p className="text-sm text-rose-300">{error}</p> : inspection && <div className="executable-inspection"><p className="section-label">EXECUTABLE</p><b>{inspection.name}</b><code>{inspection.path}</code>{!inspection.isExecutable ? <p className="drop-result">This file is not marked as executable.</p> : inspection.instances.length === 0 ? <p className="drop-result">No running instance found.</p> : <><p className="drop-result">{inspection.instances.length} running {inspection.instances.length === 1 ? "instance" : "instances"} found</p>{inspection.instances.map((instance) => <div className="executable-instance" key={instance.pid}><span><b>PID {instance.pid}</b><small>{instance.state}</small></span><code>{instance.path}</code><em>{instance.ports.length ? instance.ports.map((port) => `:${port}`).join(", ") : "No listening port"}</em></div>)}</>}</div>}</Modal>; }
 function ListenerMenu({ listener, onStop, children }: { listener: Listener; onStop: (listener: Listener) => void; children: React.ReactNode }) {
   const primary = listener.bindings[0]?.address ?? "127.0.0.1";
   return <ContextMenu.Root><ContextMenu.Trigger asChild>{children}</ContextMenu.Trigger><ContextMenu.Portal><ContextMenu.Content className="context-menu"><ContextMenu.Label>Port {listener.port} · {listener.processName}</ContextMenu.Label><ContextMenu.Item onSelect={() => portmanApi.open(listener)}><ExternalLink size={14}/> Open in browser</ContextMenu.Item><ContextMenu.Item onSelect={() => navigator.clipboard.writeText(`http://${primary}:${listener.port}`)}><Copy size={14}/> Copy URL</ContextMenu.Item><ContextMenu.Item onSelect={() => navigator.clipboard.writeText(String(listener.port))}><Copy size={14}/> Copy port</ContextMenu.Item><ContextMenu.Separator/><ContextMenu.Item className="danger-item" disabled={!listener.canStop} onSelect={() => onStop(listener)}><CircleStop size={14}/> {listener.canStop ? "Stop process" : "Protected process"}</ContextMenu.Item></ContextMenu.Content></ContextMenu.Portal></ContextMenu.Root>;

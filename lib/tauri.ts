@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { ExecutableInspection, InstanceAnomaly, Listener, ProcessMetrics, ProcessThread, RemoteConnection, SandboxStatus, StopResult, StopRisk } from "./types";
+import type { ExecutableInspection, InstanceAnomaly, Listener, MemoryGuardStatus, ProcessMetrics, ProcessThread, RemoteConnection, SandboxStatus, StopResult, StopRisk } from "./types";
 
 const inTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
@@ -12,6 +12,9 @@ export const portmanApi = {
   inspectExecutable: (path: string) => invoke<ExecutableInspection>("inspect_executable", { path }),
   anomalies: (pids: number[]) => inTauri() ? invoke<InstanceAnomaly[]>("instance_anomalies", { pids }) : Promise.resolve<InstanceAnomaly[]>([]),
   stopRisk: (pid: number) => inTauri() ? invoke<StopRisk>("stop_risk", { pid }) : Promise.resolve<StopRisk>({ level: "low", score: 0, blocked: false, reasons: [], consequence: "", previousStops: 0 }),
+  memoryGuard: () => inTauri() ? invoke<MemoryGuardStatus>("memory_guard_status") : Promise.resolve<MemoryGuardStatus>({ enabled: false, thresholdPercent: 95 }),
+  setMemoryGuard: (enabled: boolean) => invoke<MemoryGuardStatus>("set_memory_guard", { enabled }),
+  resume: (pid: number) => invoke<StopResult>("resume_listener", { pid }),
   outboundConnections: (pid: number) => invoke<RemoteConnection[]>("outbound_connections", { pid }),
   sandboxStatus: () => inTauri()
     ? invoke<SandboxStatus>("process_sandbox_status")

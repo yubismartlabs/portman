@@ -5,7 +5,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import * as ContextMenu from "@radix-ui/react-context-menu";
 import { Activity, ArrowUpDown, ChevronDown, CircleStop, Copy, ExternalLink, Globe2, Grid2X2, List, Loader2, LockKeyhole, RefreshCw, Search, Server, ShieldAlert, ShieldCheck, TerminalSquare, X } from "lucide-react";
-import type { BinaryTrust, ExecutableInspection, InstanceAnomaly, Listener, ProcessMetrics, ProcessThread, RemoteConnection, SandboxStatus, StopRisk } from "@/lib/types";
+import type { BinaryTrust, ExecutableInspection, InstanceAnomaly, Listener, MemoryGuardAlert, MemoryGuardStatus, ProcessMetrics, ProcessThread, RemoteConnection, SandboxStatus, StopRisk } from "@/lib/types";
 import { filterAndSortListeners, listenerAddress } from "@/lib/listeners";
 import { portmanApi } from "@/lib/tauri";
 import { Button, Modal } from "@/components/ui";
@@ -39,6 +39,8 @@ export function PortMan() {
   const [droppedExecutable, setDroppedExecutable] = useState<ExecutableInspection | null>(null);
   const [dropError, setDropError] = useState("");
   const [anomalies, setAnomalies] = useState<Record<number, InstanceAnomaly>>({});
+  const [memoryGuard, setMemoryGuard] = useState<MemoryGuardStatus | null>(null);
+  const [memoryAlert, setMemoryAlert] = useState<MemoryGuardAlert | null>(null);
 
   const refresh = useCallback(async () => {
     setError("");
@@ -49,6 +51,7 @@ export function PortMan() {
 
   useEffect(() => { refresh(); }, [refresh]);
   useEffect(() => { portmanApi.sandboxStatus().then(setSandboxStatus).catch(() => setSandboxStatus(null)); }, []);
+  useEffect(() => { portmanApi.memoryGuard().then(setMemoryGuard).catch(() => setMemoryGuard(null)); }, []);
   useEffect(() => {
     if (!("__TAURI_INTERNALS__" in window)) return;
     let unlisten: (() => void) | undefined;
@@ -62,6 +65,7 @@ export function PortMan() {
     listen<string>("shortcut-action", (event) => { setNotice(event.payload); refresh(); }).then((fn) => { unlistenAction = fn; });
     return () => { unlistenScan?.(); unlistenAction?.(); };
   }, [refresh]);
+  useEffect(() => { if (!("__TAURI_INTERNALS__" in window)) return; let unlisten: (() => void) | undefined; listen<MemoryGuardAlert>("memory-guard-alert", (event) => setMemoryAlert(event.payload)).then((fn) => { unlisten = fn; }); return () => unlisten?.(); }, []);
   useEffect(() => {
     if (!("__TAURI_INTERNALS__" in window)) return;
     let unlisten: (() => void) | undefined;
@@ -129,6 +133,7 @@ export function PortMan() {
       <div className="brand"><div className="brand-mark"><Activity size={19}/></div><div><b>PortMan</b><span>LOCAL SERVER MANAGER</span></div></div>
       <div className="sidebar-summary"><p>ACTIVE LISTENERS</p><b>{listeners.length}</b><span>{manageable} manageable by you</span></div>
       <div className="sidebar-section"><p>SCOPE</p><button className={filter === "all" ? "sidebar-filter active" : "sidebar-filter"} onClick={() => setFilter("all")}><i/>All interfaces</button><button className={filter === "localhost" ? "sidebar-filter active" : "sidebar-filter"} onClick={() => setFilter("localhost")}><i/>Localhost only</button></div>
+      <div className="sidebar-section"><p>MEMORY GUARD</p><button className={memoryGuard?.enabled ? "sidebar-filter active" : "sidebar-filter"} onClick={() => portmanApi.setMemoryGuard(!memoryGuard?.enabled).then(setMemoryGuard)}><i/>{memoryGuard?.enabled ? "Armed at 95%" : "Enable protection"}</button></div>
       <div className="sidebar-spacer" />
       <div className="scanner-card"><span className="pulse"/><div><b>Scanner active</b><p>TCP · refreshes every second</p></div></div>
       {sandboxStatus && <div className={`isolation-card ${sandboxStatus.level}`} title={`${sandboxStatus.details}${sandboxStatus.indicators.length ? ` Indicators: ${sandboxStatus.indicators.join(", ")}` : ""}`}><ShieldCheck size={15}/><div><b>{sandboxStatus.environment}</b><p>Isolation: {sandboxStatus.level}</p></div></div>}
@@ -151,12 +156,14 @@ export function PortMan() {
     <Confirm listener={stopping} ports={listeners.filter((item) => item.pid === stopping?.pid).map((item) => item.port)} force={false} busy={busy} onClose={() => setStopping(null)} onConfirm={() => stopping && terminate(stopping)} />
     <Confirm listener={force} ports={listeners.filter((item) => item.pid === force?.pid).map((item) => item.port)} force busy={busy} onClose={() => setForce(null)} onConfirm={() => force && terminate(force, true)} />
     <ExecutableModal inspection={droppedExecutable} error={dropError} onClose={() => { setDroppedExecutable(null); setDropError(""); }} />
+    <MemoryGuardModal alert={memoryAlert} onClose={() => setMemoryAlert(null)} onResume={async () => { if (memoryAlert) { const result = await portmanApi.resume(memoryAlert.pid); setNotice(result.message); setMemoryAlert(null); refresh(); } }} />
     </div>
   </main>;
 }
 
 function Empty({ icon, title, text }: { icon: React.ReactNode; title: string; text: string }) { return <div className="empty"><span>{icon}</span><b>{title}</b><p>{text}</p></div>; }
 function ExecutableModal({ inspection, error, onClose }: { inspection: ExecutableInspection | null; error: string; onClose: () => void }) { const open = !!inspection || !!error; return <Modal open={open} onOpenChange={(value) => !value && onClose()} title="Dropped executable inspection">{error ? <p className="text-sm text-rose-300">{error}</p> : inspection && <div className="executable-inspection"><p className="section-label">EXECUTABLE</p><b>{inspection.name}</b><code>{inspection.path}</code>{!inspection.isExecutable ? <p className="drop-result">This file is not marked as executable.</p> : inspection.instances.length === 0 ? <p className="drop-result">No running instance found.</p> : <><p className="drop-result">{inspection.instances.length} running {inspection.instances.length === 1 ? "instance" : "instances"} found</p>{inspection.instances.map((instance) => <div className="executable-instance" key={instance.pid}><span><b>PID {instance.pid}</b><small>{instance.state}</small></span><code>{instance.path}</code><em>{instance.ports.length ? instance.ports.map((port) => `:${port}`).join(", ") : "No listening port"}</em></div>)}</>}</div>}</Modal>; }
+function MemoryGuardModal({ alert, onClose, onResume }: { alert: MemoryGuardAlert | null; onClose: () => void; onResume: () => void }) { return <Modal open={!!alert} onOpenChange={(value) => !value && onClose()} title="Memory guard activated">{alert && <div><p className="text-sm leading-6 text-slate-300">System memory reached {alert.utilizationPercent.toFixed(1)}%. PortMan paused the lowest-priority heavy local instance before the system became unresponsive.</p><div className="my-4 rounded-lg border border-rose-900/70 bg-rose-950/30 p-3"><b className="text-sm">{alert.processName} <span className="font-mono text-slate-400">(PID {alert.pid})</span></b><p className="mt-1 text-xs text-slate-400">Paused memory: {formatBytes(alert.memoryBytes)} · System total: {formatBytes(alert.totalMemoryBytes)}</p></div><div className="flex justify-end gap-2"><Button variant="ghost" onClick={onClose}>Keep paused</Button><Button variant="danger" onClick={onResume}>Resume instance</Button></div></div>}</Modal>; }
 function ListenerMenu({ listener, onStop, children }: { listener: Listener; onStop: (listener: Listener) => void; children: React.ReactNode }) {
   const primary = listener.bindings[0]?.address ?? "127.0.0.1";
   return <ContextMenu.Root><ContextMenu.Trigger asChild>{children}</ContextMenu.Trigger><ContextMenu.Portal><ContextMenu.Content className="context-menu"><ContextMenu.Label>Port {listener.port} · {listener.processName}</ContextMenu.Label><ContextMenu.Item onSelect={() => portmanApi.open(listener)}><ExternalLink size={14}/> Open in browser</ContextMenu.Item><ContextMenu.Item onSelect={() => navigator.clipboard.writeText(`http://${primary}:${listener.port}`)}><Copy size={14}/> Copy URL</ContextMenu.Item><ContextMenu.Item onSelect={() => navigator.clipboard.writeText(String(listener.port))}><Copy size={14}/> Copy port</ContextMenu.Item><ContextMenu.Separator/><ContextMenu.Item className="danger-item" disabled={!listener.canStop} onSelect={() => onStop(listener)}><CircleStop size={14}/> {listener.canStop ? "Stop process" : "Protected process"}</ContextMenu.Item></ContextMenu.Content></ContextMenu.Portal></ContextMenu.Root>;

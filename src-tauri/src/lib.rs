@@ -62,8 +62,17 @@ pub struct InstanceAnomaly { pub pid: u32, pub score: f64, pub baseline_samples:
 #[serde(rename_all = "camelCase")]
 pub struct StopRisk { pub level: String, pub score: u8, pub blocked: bool, pub reasons: Vec<String>, pub consequence: String, pub previous_stops: u32 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryGuardStatus { pub enabled: bool, pub threshold_percent: u8 }
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryGuardAlert { pub pid: u32, pub process_name: String, pub memory_bytes: u64, pub total_memory_bytes: u64, pub utilization_percent: f32 }
+
 struct MetricsState(Mutex<System>);
 struct StopHistoryState(Mutex<HashMap<String, u32>>);
+struct MemoryGuardState(Mutex<MemoryGuardConfig>);
+struct MemoryGuardConfig { enabled: bool, paused_pids: std::collections::BTreeSet<u32> }
 static BINARY_TRUST_CACHE: OnceLock<Mutex<HashMap<String, BinaryTrust>>> = OnceLock::new();
 static GEO_CACHE: OnceLock<Mutex<HashMap<String, Option<GeoLocation>>>> = OnceLock::new();
 static ANOMALY_CACHE: OnceLock<Mutex<HashMap<String, ProcessBaseline>>> = OnceLock::new();
@@ -313,6 +322,26 @@ fn force_stop_listener(pid: u32, history: State<StopHistoryState>) -> Result<Sto
 }
 
 #[tauri::command]
+fn resume_listener(pid: u32, guard: State<MemoryGuardState>) -> Result<StopResult, String> {
+  owned_process(pid)?; signal(pid, "-CONT")?;
+  if let Ok(mut config) = guard.0.lock() { config.paused_pids.remove(&pid); }
+  Ok(StopResult { stopped: false, requires_force: false, message: "Server resumed after memory protection.".into() })
+}
+#[tauri::command]
+fn memory_guard_status(guard: State<MemoryGuardState>) -> Result<MemoryGuardStatus, String> { let config = guard.0.lock().map_err(|_| "Memory guard is unavailable.".to_string())?; Ok(MemoryGuardStatus { enabled: config.enabled, threshold_percent: 95 }) }
+#[tauri::command]
+fn set_memory_guard(enabled: bool, guard: State<MemoryGuardState>) -> Result<MemoryGuardStatus, String> { let mut config = guard.0.lock().map_err(|_| "Memory guard is unavailable.".to_string())?; config.enabled = enabled; Ok(MemoryGuardStatus { enabled, threshold_percent: 95 }) }
+fn process_nice(pid: u32) -> i32 { Command::new("ps").args(["-p", &pid.to_string(), "-o", "nice="]).output().ok().and_then(|output| String::from_utf8_lossy(&output.stdout).trim().parse().ok()).unwrap_or(0) }
+fn check_memory_guard(app: &AppHandle) {
+  let guard = app.state::<MemoryGuardState>(); let Ok(mut config) = guard.0.lock() else { return; }; if !config.enabled { return; }
+  let mut system = System::new(); system.refresh_memory(); let total = system.total_memory(); let used = system.used_memory();
+  if total == 0 || used.saturating_mul(100) < total.saturating_mul(95) { return; }
+  let listeners = match scan_listeners() { Ok(value) => value, Err(_) => return }; let mut processes = System::new(); processes.refresh_processes(ProcessesToUpdate::All, true);
+  let candidate = listeners.iter().filter(|listener| listener.can_stop && !config.paused_pids.contains(&listener.pid)).filter_map(|listener| processes.process(Pid::from_u32(listener.pid)).map(|process| (listener, process.memory(), process_nice(listener.pid)))).max_by_key(|(_, memory, nice)| (*nice, *memory));
+  if let Some((listener, memory, _)) = candidate { if signal(listener.pid, "-STOP").is_ok() { config.paused_pids.insert(listener.pid); let _ = app.emit("memory-guard-alert", MemoryGuardAlert { pid: listener.pid, process_name: listener.process_name.clone(), memory_bytes: memory, total_memory_bytes: total, utilization_percent: used as f32 / total as f32 * 100.0 }); } }
+}
+
+#[tauri::command]
 fn process_metrics(pid: u32, state: State<MetricsState>) -> Result<ProcessMetrics, String> {
   let process_pid = Pid::from_u32(pid);
   let mut system = state.0.lock().map_err(|_| "Metrics sampler is unavailable.".to_string())?;
@@ -432,6 +461,7 @@ fn start_watcher(app: AppHandle) {
     let mut last: Vec<Listener> = Vec::new();
     loop {
       if let Ok(next) = scan_listeners() { if next != last { let _ = app.emit("server-list-updated", &next); last = next; } }
+      check_memory_guard(&app);
       thread::sleep(Duration::from_secs(1));
     }
   });
@@ -440,7 +470,7 @@ fn start_watcher(app: AppHandle) {
 pub fn run() {
   let show_portman = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyP);
   let kill_frontmost = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT | Modifiers::SHIFT), Code::KeyK);
-  tauri::Builder::default().manage(MetricsState(Mutex::new(System::new()))).manage(StopHistoryState(Mutex::new(HashMap::new()))).plugin(tauri_plugin_opener::init()).setup(move |app| {
+  tauri::Builder::default().manage(MetricsState(Mutex::new(System::new()))).manage(StopHistoryState(Mutex::new(HashMap::new()))).manage(MemoryGuardState(Mutex::new(MemoryGuardConfig { enabled: false, paused_pids: std::collections::BTreeSet::new() }))).plugin(tauri_plugin_opener::init()).setup(move |app| {
     let show_portman = show_portman; let kill_frontmost = kill_frontmost;
     app.handle().plugin(tauri_plugin_global_shortcut::Builder::new().with_handler(move |app, shortcut, event| {
       if event.state() != ShortcutState::Pressed { return; }
@@ -452,7 +482,7 @@ pub fn run() {
     app.global_shortcut().register(kill_frontmost)?;
     start_watcher(app.handle().clone()); Ok(())
   })
-    .invoke_handler(tauri::generate_handler![list_listeners, stop_listener, force_stop_listener, stop_risk, process_metrics, process_threads, inspect_executable, instance_anomalies, outbound_connections, open_listener, process_sandbox_status])
+    .invoke_handler(tauri::generate_handler![list_listeners, stop_listener, force_stop_listener, resume_listener, stop_risk, memory_guard_status, set_memory_guard, process_metrics, process_threads, inspect_executable, instance_anomalies, outbound_connections, open_listener, process_sandbox_status])
     .run(tauri::generate_context!()).expect("error while running PortMan");
 }
 

@@ -29,6 +29,8 @@ export type ExecutableInspection = { name: string; path: string; isExecutable: b
 
 export type InstanceAnomaly = { pid: number; score: number; baselineSamples: number; isAnomalous: boolean; summary: string; cpuPercent: number; memoryBytes: number; outboundConnections: number; novelRemoteConnections: number };
 export type StopRisk = { level: "low" | "medium" | "critical"; score: number; blocked: boolean; reasons: string[]; consequence: string; previousStops: number };
+export type MemoryGuardStatus = { enabled: boolean; thresholdPercent: number };
+export type MemoryGuardAlert = { pid: number; processName: string; memoryBytes: number; totalMemoryBytes: number; utilizationPercent: number };
 
 export type GeoLocation = { city: string; country: string; latitude: number; longitude: number };
 export type RemoteConnection = { remoteIp: string; remotePort: number; location: GeoLocation | null };

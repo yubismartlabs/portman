@@ -1,6 +1,6 @@
 [package]
 name = "portman"
-version = "0.1.0"
+version = "0.1.1"
 description = "A local server manager"
 authors = ["PortMan"]
 edition = "2021"

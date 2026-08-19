@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::{collections::{BTreeMap, HashMap}, path::Path, process::Command, sync::{Mutex, OnceLock}, thread, time::Duration};
 use sysinfo::{Pid, ProcessesToUpdate, System};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, ShortcutState};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -177,6 +178,30 @@ fn signal(pid: u32, signal: &str) -> Result<(), String> {
   if status.success() { Ok(()) } else { Err("macOS refused to signal this process.".to_string()) }
 }
 
+fn frontmost_process_id() -> Result<u32, String> {
+  #[cfg(target_os = "macos")]
+  let output = Command::new("/usr/bin/osascript").args(["-e", "tell application \"System Events\" to get unix id of first application process whose frontmost is true"]).output().map_err(|e| format!("Could not inspect the frontmost application: {e}"))?;
+  #[cfg(not(target_os = "macos"))]
+  return Err("Killing the frontmost window is currently available on macOS only.".into());
+  #[cfg(target_os = "macos")]
+  if !output.status.success() { return Err("PortMan needs macOS Accessibility permission to identify the frontmost application.".into()); }
+  #[cfg(target_os = "macos")]
+  String::from_utf8_lossy(&output.stdout).trim().parse().map_err(|_| "Could not determine the frontmost application process.".into())
+}
+
+fn focus_and_scan(app: &AppHandle) {
+  if let Some(window) = app.get_webview_window("main") { let _ = window.show(); let _ = window.set_focus(); }
+  let _ = app.emit("shortcut-scan", ());
+}
+
+fn kill_frontmost_process(app: &AppHandle) {
+  let result = frontmost_process_id().and_then(|pid| {
+    if pid == std::process::id() { return Err("PortMan will not terminate itself.".into()); }
+    signal(pid, "-TERM").map(|_| format!("Sent a quit signal to frontmost process {pid}."))
+  });
+  let _ = app.emit("shortcut-action", result.unwrap_or_else(|error| error));
+}
+
 #[tauri::command]
 fn list_listeners() -> Result<Vec<Listener>, String> { scan_listeners() }
 
@@ -284,7 +309,20 @@ fn start_watcher(app: AppHandle) {
 }
 
 pub fn run() {
-  tauri::Builder::default().manage(MetricsState(Mutex::new(System::new()))).plugin(tauri_plugin_opener::init()).setup(|app| { start_watcher(app.handle().clone()); Ok(()) })
+  let show_portman = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyP);
+  let kill_frontmost = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT | Modifiers::SHIFT), Code::KeyK);
+  tauri::Builder::default().manage(MetricsState(Mutex::new(System::new()))).plugin(tauri_plugin_opener::init()).setup(move |app| {
+    let show_portman = show_portman; let kill_frontmost = kill_frontmost;
+    app.handle().plugin(tauri_plugin_global_shortcut::Builder::new().with_handler(move |app, shortcut, event| {
+      if event.state() != ShortcutState::Pressed { return; }
+      if shortcut == &show_portman { focus_and_scan(app); }
+      if shortcut == &kill_frontmost { kill_frontmost_process(app); }
+    }).build())?;
+    use tauri_plugin_global_shortcut::GlobalShortcutExt;
+    app.global_shortcut().register(show_portman)?;
+    app.global_shortcut().register(kill_frontmost)?;
+    start_watcher(app.handle().clone()); Ok(())
+  })
     .invoke_handler(tauri::generate_handler![list_listeners, stop_listener, force_stop_listener, process_metrics, process_threads, outbound_connections, open_listener, process_sandbox_status])
     .run(tauri::generate_context!()).expect("error while running PortMan");
 }

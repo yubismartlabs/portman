@@ -51,6 +51,13 @@ export function PortMan() {
     listen<Listener[]>("server-list-updated", (event) => { setListeners(event.payload); setLastUpdated(new Date()); }).then((fn) => { unlisten = fn; });
     return () => unlisten?.();
   }, []);
+  useEffect(() => {
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    let unlistenScan: (() => void) | undefined; let unlistenAction: (() => void) | undefined;
+    listen("shortcut-scan", () => { refresh(); setNotice("PortMan opened and listener scan refreshed."); }).then((fn) => { unlistenScan = fn; });
+    listen<string>("shortcut-action", (event) => { setNotice(event.payload); refresh(); }).then((fn) => { unlistenAction = fn; });
+    return () => { unlistenScan?.(); unlistenAction?.(); };
+  }, [refresh]);
 
   const visible = useMemo(() => filterAndSortListeners(listeners, query, filter, sort), [listeners, query, filter, sort]);
   const selected = listeners.find((listener) => listener.id === selectedId) ?? null;
@@ -115,7 +122,7 @@ export function PortMan() {
           {selected && <Inspector listener={selected} metrics={metrics} history={metricHistory} connections={connections} onClose={() => setSelectedId(null)} onStop={setStopping} />}
         </section>
       </div>
-      <footer className="statusbar"><span><i className="pulse"/> Native scanner online</span><span>TCP listeners only</span><span>{sandboxStatus ? `Isolation: ${sandboxStatus.level}` : "Checking isolation…"}</span><span>Current user processes can be stopped</span></footer>
+      <footer className="statusbar"><span><i className="pulse"/> Native scanner online</span><span>⌃⌥P: Show & scan</span><span>⌃⌥⇧K: Quit frontmost app</span><span>{sandboxStatus ? `Isolation: ${sandboxStatus.level}` : "Checking isolation…"}</span><span>Current user processes can be stopped</span></footer>
     </section>
     <Confirm listener={stopping} ports={listeners.filter((item) => item.pid === stopping?.pid).map((item) => item.port)} force={false} busy={busy} onClose={() => setStopping(null)} onConfirm={() => stopping && terminate(stopping)} />
     <Confirm listener={force} ports={listeners.filter((item) => item.pid === force?.pid).map((item) => item.port)} force busy={busy} onClose={() => setForce(null)} onConfirm={() => force && terminate(force, true)} />

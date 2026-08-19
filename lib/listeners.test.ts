@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { filterAndSortListeners } from "./listeners";
+import { filterAndSortListeners, listenerHttpUrl } from "./listeners";
 import type { Listener } from "./types";
 
 const records: Listener[] = [
@@ -10,4 +10,8 @@ const records: Listener[] = [
 describe("filterAndSortListeners", () => {
   it("limits to localhost bindings and sorts by port", () => expect(filterAndSortListeners(records, "", "localhost", "port").map((item) => item.port)).toEqual([3000]));
   it("searches command/process data and sorts by name", () => expect(filterAndSortListeners(records, "host", "all", "name").map((item) => item.processName)).toEqual(["vite"]));
+  it("builds browser-safe URLs for wildcard and IPv6 listeners", () => {
+    expect(listenerHttpUrl(records[0])).toBe("http://127.0.0.1:5173");
+    expect(listenerHttpUrl({ ...records[1], bindings: [{ address: "::1", isLocalhost: true }] })).toBe("http://[::1]:3000");
+  });
 });

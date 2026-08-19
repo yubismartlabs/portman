@@ -22,5 +22,11 @@
     "category": "DeveloperTool",
     "shortDescription": "A local server manager for macOS.",
     "icon": ["icons/portman-icon.png", "icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDIyMUY3MTREMTc3ODA5OApSV1NZZ0hmUkZQY2hBbDhQY29rRWtrcmdzbFgzSWVXTkF3Njd2Zlg0VlBraGRqNXlDaTRxc1Npbwo=",
+      "endpoints": ["https://github.com/yubismartlabs/portman/releases/latest/download/latest.json"]
+    }
   }
 }

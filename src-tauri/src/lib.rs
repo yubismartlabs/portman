@@ -1770,6 +1770,8 @@ pub fn run() {
     );
     let blocked_hashes = local_blocked_hashes();
     tauri::Builder::default()
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(MetricsState(Mutex::new(System::new())))
         .manage(StopHistoryState(Mutex::new(HashMap::new())))
         .manage(MemoryGuardState(Mutex::new(MemoryGuardConfig {

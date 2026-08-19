@@ -3,6 +3,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { check } from "@tauri-apps/plugin-updater";
 import * as ContextMenu from "@radix-ui/react-context-menu";
 import { Activity, ArrowUpDown, ChevronDown, CircleStop, Copy, ExternalLink, Globe2, Grid2X2, List, Loader2, LockKeyhole, RefreshCw, Search, Server, ShieldAlert, ShieldCheck, SlidersHorizontal, TerminalSquare, X } from "lucide-react";
 import type { BinaryTrust, ExecutableInspection, ExecutionWatcherStatus, InstanceAnomaly, Listener, MemoryGuardAlert, MemoryGuardStatus, PostureCheck, ProcessMetrics, ProcessThread, QuarantineEntry, RemoteConnection, SandboxStatus, StopRisk, SystemPosture } from "@/lib/types";
@@ -14,6 +16,7 @@ type Filter = "all" | "localhost";
 type Sort = "port" | "name";
 type ViewMode = "list" | "grid";
 type WorkspaceTab = "listeners" | "quarantine" | "posture" | "controls";
+type AvailableUpdate = { version: string; body?: string | null };
 const truncate = (value: string, max = 56) => value.length > max ? `${value.slice(0, max)}…` : value;
 const statusLabel = (listener: Listener) => listener.isProtected ? "Protected" : "Running";
 const trustLabel = (trust: BinaryTrust) => ({ trusted: "Trusted binary", signed: "Signed but untrusted binary", unsigned: "Unsigned binary", unknown: "Signature unavailable" })[trust];
@@ -49,6 +52,8 @@ export function PortMan() {
   const [fixing, setFixing] = useState<PostureCheck | null>(null);
   const [controlUpdating, setControlUpdating] = useState<"memory" | "watcher" | null>(null);
   const [nativeRuntime, setNativeRuntime] = useState(false);
+  const [availableUpdate, setAvailableUpdate] = useState<AvailableUpdate | null>(null);
+  const [installingUpdate, setInstallingUpdate] = useState(false);
 
   const refresh = useCallback(async () => {
     setError("");
@@ -59,6 +64,14 @@ export function PortMan() {
 
   useEffect(() => { refresh(); }, [refresh]);
   useEffect(() => { setNativeRuntime(portmanApi.isNative()); }, []);
+  useEffect(() => {
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    let active = true;
+    check().then((update) => {
+      if (active && update) setAvailableUpdate({ version: update.version, body: update.body });
+    }).catch(() => { /* An unreachable update endpoint must not interrupt local server management. */ });
+    return () => { active = false; };
+  }, []);
   useEffect(() => { portmanApi.sandboxStatus().then(setSandboxStatus).catch(() => setSandboxStatus(null)); }, []);
   useEffect(() => { portmanApi.memoryGuard().then(setMemoryGuard).catch(() => setMemoryGuard(null)); }, []);
   useEffect(() => { portmanApi.executionWatcher().then(setWatcher).catch(() => setWatcher(null)); portmanApi.quarantined().then(setQuarantine).catch(() => setQuarantine([])); }, []);
@@ -184,6 +197,25 @@ export function PortMan() {
     } catch (cause) { setNotice(cause instanceof Error ? cause.message : "Could not resume the process."); }
   }, [memoryAlert, refresh]);
 
+  const installUpdate = useCallback(async () => {
+    if (!availableUpdate) return;
+    setInstallingUpdate(true);
+    try {
+      const update = await check();
+      if (!update) {
+        setAvailableUpdate(null);
+        setNotice("PortMan is already up to date.");
+        return;
+      }
+      await update.downloadAndInstall();
+      await relaunch();
+    } catch (cause) {
+      setNotice(cause instanceof Error ? cause.message : "Could not install the PortMan update.");
+    } finally {
+      setInstallingUpdate(false);
+    }
+  }, [availableUpdate]);
+
   return <main className="desktop-shell">
     <header className="topbar"><div className="window-title" data-tauri-drag-region><Server size={15}/><b>Local listeners</b><span>{listeners.length} active</span></div><div className="title-drag-region" data-tauri-drag-region/><div className="title-search"><Search size={14}/><input aria-label="Search listeners" placeholder="Search processes, ports, or addresses" value={query} onChange={(event) => setQuery(event.target.value)}/>{query && <button onClick={() => setQuery("")}><X size={13}/></button>}</div><div className="topbar-actions"><span className="updated">{lastUpdated ? `Last scan ${lastUpdated.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : "Connecting…"}</span><Button variant="ghost" onClick={refresh}><RefreshCw size={15}/> Refresh</Button></div></header>
     <div className="desktop-body">
@@ -215,6 +247,7 @@ export function PortMan() {
     <ExecutableModal inspection={droppedExecutable} error={dropError} onClose={() => { setDroppedExecutable(null); setDropError(""); }} />
     <MemoryGuardModal alert={memoryAlert} onClose={() => setMemoryAlert(null)} onResume={resumeMemoryGuard} />
     <PostureFixModal check={fixing} onClose={() => setFixing(null)} onConfirm={async () => { if (!fixing) return; try { setNotice(await portmanApi.applyPostureFix(fixing.id)); setFixing(null); setPosture(await portmanApi.posture()); } catch (cause) { setNotice(cause instanceof Error ? cause.message : "The setting could not be changed."); } }} />
+    <UpdateModal update={availableUpdate} installing={installingUpdate} onClose={() => setAvailableUpdate(null)} onInstall={installUpdate} />
     </div>
   </main>;
 }
@@ -222,6 +255,7 @@ export function PortMan() {
 function QuarantinePanel({ entries, watcher, onResume }: { entries: QuarantineEntry[]; watcher: ExecutionWatcherStatus | null; onResume: (pid: number) => void }) { return <section className="quarantine-pane"><div className="pane-title"><div><h2>Quarantine</h2><p>Suspicious executable launches retained for review</p></div><ShieldAlert size={19}/></div><div className="quarantine-mode"><ShieldCheck size={15}/><span>{watcher?.platformMode ?? "Loading execution watcher…"}</span></div>{entries.length === 0 ? <Empty icon={<ShieldCheck/>} title="No quarantined executions" text="New executable processes are scanned as they appear. Auto-pause is optional."/> : <div className="quarantine-list">{entries.map((entry) => <article className={`quarantine-entry ${entry.state}`} key={entry.id}><div><div className="quarantine-entry-head"><b>{entry.processName}</b><span>{entry.state}</span></div><p>PID {entry.pid} · {new Date(entry.detectedAt * 1000).toLocaleString()}</p><code title={entry.path}>{entry.path}</code><small>SHA-256 {entry.sha256}</small><ul>{entry.reasons.map((reason) => <li key={reason}>{reason}</li>)}</ul></div>{entry.canResume && <Button variant="ghost" onClick={() => onResume(entry.pid)}>Resume</Button>}</article>)}</div>}</section>; }
 function PosturePanel({ posture, onRefresh, onFix }: { posture: SystemPosture | null; onRefresh: () => Promise<void>; onFix: (check: PostureCheck) => void }) { return <section className="posture-pane"><div className="pane-title"><div><h2>System posture</h2><p>Host protections and exposure checks</p></div><Button variant="ghost" onClick={() => void onRefresh()}><RefreshCw size={14}/> Refresh</Button></div>{!posture ? <Empty icon={<Loader2 className="animate-spin"/>} title="Assessing system protections" text="Reading local security settings."/> : <><div className="posture-score"><div><span>{posture.score}</span><small>/100</small></div><section><b>{posture.score >= 90 ? "Strong protection" : posture.score >= 70 ? "Needs attention" : "Protection gaps found"}</b><p>{posture.platform} · Failed checks reduce the score by 25; warnings by 10.</p></section></div><div className="posture-checks">{posture.checks.map((check) => <article key={check.id} className={`posture-check ${check.status}`}><span className="posture-icon">{check.status === "pass" ? <ShieldCheck size={18}/> : <ShieldAlert size={18}/>}</span><div><div className="posture-check-heading"><b>{check.title}</b><em>{check.status}</em></div><p>{check.summary}</p><small>{check.remediation}</small></div>{check.canFix && <Button variant="ghost" onClick={() => onFix(check)}>Fix</Button>}</article>)}</div></>}</section>; }
 function ProtectionControls({ memoryGuard, watcher, updating, onMemoryGuardChange, onWatcherChange }: { memoryGuard: MemoryGuardStatus | null; watcher: ExecutionWatcherStatus | null; updating: "memory" | "watcher" | null; onMemoryGuardChange: (enabled: boolean) => Promise<void>; onWatcherChange: (enabled: boolean, autoPause: boolean) => Promise<void> }) { return <section className="controls-pane"><div className="pane-title"><div><h2>Protection controls</h2><p>Configure local safeguards and review how they act.</p></div><SlidersHorizontal size={19}/></div><div className="control-cards"><article className="control-card"><div className="control-card-heading"><span><ShieldAlert size={18}/></span><div><b>Memory guard</b><p>Pauses the heaviest manageable listener when system memory reaches its threshold.</p></div></div><div className="control-card-footer"><small>{memoryGuard ? memoryGuard.enabled ? `Armed at ${memoryGuard.thresholdPercent}% memory use` : "Disabled" : "Checking availability…"}</small><Button variant={memoryGuard?.enabled ? "ghost" : "default"} disabled={!memoryGuard || updating === "memory"} onClick={() => void onMemoryGuardChange(!memoryGuard?.enabled)}>{updating === "memory" && <Loader2 className="animate-spin" size={14}/>} {memoryGuard?.enabled ? "Disable" : "Enable"}</Button></div></article><article className="control-card"><div className="control-card-heading"><span><ShieldCheck size={18}/></span><div><b>Execution watcher</b><p>Reviews newly launched executables against local signals and the bundled signature list.</p></div></div><div className="control-card-footer"><small>{watcher ? watcher.enabled ? watcher.autoPause ? "Monitoring and auto-pausing suspicious launches" : "Monitoring; suspicious launches remain available for review" : "Disabled" : "Checking availability…"}</small><Button variant={watcher?.enabled ? "ghost" : "default"} disabled={!watcher || updating === "watcher"} onClick={() => watcher && void onWatcherChange(!watcher.enabled, watcher.autoPause)}>{updating === "watcher" && <Loader2 className="animate-spin" size={14}/>} {watcher?.enabled ? "Disable" : "Enable"}</Button></div>{watcher?.enabled && <label className="control-checkbox"><input type="checkbox" checked={watcher.autoPause} disabled={updating === "watcher"} onChange={(event) => void onWatcherChange(watcher.enabled, event.target.checked)} /> <span>Pause suspicious launches automatically</span></label>}</article><article className="control-card control-note"><div className="control-card-heading"><span><ShieldCheck size={18}/></span><div><b>Review queue</b><p>Paused executions can be resumed only after PortMan confirms the process and its recorded file hash still match.</p></div></div><small>Use the Quarantine workspace to inspect executable paths, hashes, detection reasons, and available resume actions.</small></article></div></section>; }
+function UpdateModal({ update, installing, onClose, onInstall }: { update: AvailableUpdate | null; installing: boolean; onClose: () => void; onInstall: () => void }) { return <Modal open={!!update} onOpenChange={(open) => !open && onClose()} title="Update available">{update && <div><p className="text-sm leading-6 text-slate-300">PortMan {update.version} is ready. Install it now to restart with the latest version.</p>{update.body && <div className="my-4 max-h-36 overflow-auto rounded-lg border border-slate-700 bg-black/20 p-3 text-xs leading-5 text-slate-300 whitespace-pre-wrap">{update.body}</div>}<div className="mt-5 flex justify-end gap-2"><Button variant="ghost" onClick={onClose} disabled={installing}>Later</Button><Button variant="default" onClick={onInstall} disabled={installing}>{installing && <Loader2 className="animate-spin" size={15}/>} Install &amp; restart</Button></div></div>}</Modal>; }
 function PostureFixModal({ check, onClose, onConfirm }: { check: PostureCheck | null; onClose: () => void; onConfirm: () => void }) { return <Modal open={!!check} onOpenChange={(open) => !open && onClose()} title={`Enable ${check?.title ?? "protection"}?`}>{check && <div><p className="text-sm leading-6 text-slate-300">PortMan will request macOS administrator authorization to apply this setting. It will run only the built-in remediation for {check.title}.</p><div className="my-4 rounded-lg border border-slate-700 bg-black/20 p-3 text-xs text-slate-300">{check.remediation}</div><div className="flex justify-end gap-2"><Button variant="ghost" onClick={onClose}>Cancel</Button><Button variant="danger" onClick={onConfirm}>Request authorization</Button></div></div>}</Modal>; }
 
 function Empty({ icon, title, text }: { icon: React.ReactNode; title: string; text: string }) { return <div className="empty"><span>{icon}</span><b>{title}</b><p>{text}</p></div>; }

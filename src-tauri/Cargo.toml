@@ -21,3 +21,7 @@ sysinfo = "0.39.6"
 tauri = { version = "2", features = [] }
 tauri-plugin-global-shortcut = "2"
 thiserror = "2"
+
+[target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
+tauri-plugin-process = "2.3.1"
+tauri-plugin-updater = "2.10.1"

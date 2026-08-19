@@ -54,9 +54,23 @@ pub struct ExecutableInstance { pub pid: u32, pub path: String, pub state: Strin
 #[serde(rename_all = "camelCase")]
 pub struct ExecutableInspection { pub name: String, pub path: String, pub is_executable: bool, pub instances: Vec<ExecutableInstance> }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstanceAnomaly { pub pid: u32, pub score: f64, pub baseline_samples: u32, pub is_anomalous: bool, pub summary: String, pub cpu_percent: f32, pub memory_bytes: u64, pub outbound_connections: usize, pub novel_remote_connections: usize }
+
 struct MetricsState(Mutex<System>);
 static BINARY_TRUST_CACHE: OnceLock<Mutex<HashMap<String, BinaryTrust>>> = OnceLock::new();
 static GEO_CACHE: OnceLock<Mutex<HashMap<String, Option<GeoLocation>>>> = OnceLock::new();
+static ANOMALY_CACHE: OnceLock<Mutex<HashMap<String, ProcessBaseline>>> = OnceLock::new();
+
+#[derive(Default)]
+struct RunningStats { samples: u32, mean: f64, m2: f64 }
+impl RunningStats {
+  fn deviation(&self, value: f64) -> f64 { if self.samples < 4 { 0.0 } else { let variance = (self.m2 / (self.samples - 1) as f64).max(0.0001); (value - self.mean) / variance.sqrt() } }
+  fn observe(&mut self, value: f64) { self.samples += 1; let delta = value - self.mean; self.mean += delta / self.samples as f64; self.m2 += delta * (value - self.mean); }
+}
+#[derive(Default)]
+struct ProcessBaseline { cpu: RunningStats, memory: RunningStats, connections: RunningStats, novel_connections: RunningStats, remotes: std::collections::BTreeSet<String> }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -274,6 +288,41 @@ fn process_metrics(pid: u32, state: State<MetricsState>) -> Result<ProcessMetric
   })
 }
 
+fn public_remote_addresses(pid: u32) -> Vec<String> {
+  let output = Command::new("/usr/sbin/lsof").args(["-nP", "-a", "-p", &pid.to_string(), "-iTCP", "-sTCP:ESTABLISHED", "-Fn"]).output().ok();
+  let mut remotes = BTreeMap::new();
+  if let Some(output) = output { for line in String::from_utf8_lossy(&output.stdout).lines() { if let Some((ip, port)) = line.strip_prefix('n').and_then(|value| value.split("->").nth(1)).and_then(parse_socket) { if !is_private_host(&ip) { remotes.insert(format!("{ip}:{port}"), ()); } } } }
+  remotes.into_keys().collect()
+}
+
+#[tauri::command]
+fn instance_anomalies(pids: Vec<u32>, state: State<MetricsState>) -> Result<Vec<InstanceAnomaly>, String> {
+  let process_ids: Vec<Pid> = pids.iter().copied().map(Pid::from_u32).collect();
+  let mut system = state.0.lock().map_err(|_| "Metrics sampler is unavailable.".to_string())?;
+  system.refresh_processes(ProcessesToUpdate::Some(&process_ids), true);
+  let cache = ANOMALY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+  let mut baselines = cache.lock().map_err(|_| "Anomaly model is unavailable.".to_string())?;
+  let mut results = Vec::new();
+  for pid in pids {
+    let Some(process) = system.process(Pid::from_u32(pid)) else { continue; };
+    let remotes = public_remote_addresses(pid);
+    let key = executable_for(pid).unwrap_or_else(|| command_for(pid));
+    let baseline = baselines.entry(key).or_default();
+    let cpu = process.cpu_usage() as f64; let memory = process.memory() as f64 / (1024.0 * 1024.0); let connections = remotes.len() as f64;
+    let novel = remotes.iter().filter(|remote| !baseline.remotes.contains(*remote)).count() as f64;
+    let deviations = [("CPU", baseline.cpu.deviation(cpu)), ("memory", baseline.memory.deviation(memory)), ("outbound connections", baseline.connections.deviation(connections)), ("new remote connections", baseline.novel_connections.deviation(novel))];
+    let score = deviations.iter().map(|(_, value)| value.powi(2)).sum::<f64>().sqrt();
+    let samples = baseline.cpu.samples;
+    let is_anomalous = samples >= 12 && score >= 4.0;
+    let strongest = deviations.iter().max_by(|a, b| a.1.abs().total_cmp(&b.1.abs())).map(|(label, _)| *label).unwrap_or("activity");
+    let summary = if samples < 12 { format!("Learning normal behavior ({samples}/12 samples).") } else if is_anomalous { format!("Unusual {strongest} compared with this executable's learned baseline. Review or force stop it.") } else { "Activity is within this executable's learned baseline.".into() };
+    baseline.cpu.observe(cpu); baseline.memory.observe(memory); baseline.connections.observe(connections); baseline.novel_connections.observe(novel);
+    for remote in remotes { if baseline.remotes.len() < 256 { baseline.remotes.insert(remote); } }
+    results.push(InstanceAnomaly { pid, score, baseline_samples: samples, is_anomalous, summary, cpu_percent: process.cpu_usage(), memory_bytes: process.memory(), outbound_connections: connections as usize, novel_remote_connections: novel as usize });
+  }
+  Ok(results)
+}
+
 fn parse_process_threads(raw: &str) -> Vec<ProcessThread> {
   let mut threads: Vec<ProcessThread> = raw.lines().filter_map(|line| {
     let mut fields = line.split_whitespace();
@@ -366,7 +415,7 @@ pub fn run() {
     app.global_shortcut().register(kill_frontmost)?;
     start_watcher(app.handle().clone()); Ok(())
   })
-    .invoke_handler(tauri::generate_handler![list_listeners, stop_listener, force_stop_listener, process_metrics, process_threads, inspect_executable, outbound_connections, open_listener, process_sandbox_status])
+    .invoke_handler(tauri::generate_handler![list_listeners, stop_listener, force_stop_listener, process_metrics, process_threads, inspect_executable, instance_anomalies, outbound_connections, open_listener, process_sandbox_status])
     .run(tauri::generate_context!()).expect("error while running PortMan");
 }
 

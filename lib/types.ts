@@ -27,6 +27,8 @@ export type ProcessThread = { id: number; name: string; cpuPercent: number };
 export type ExecutableInstance = { pid: number; path: string; state: string; ports: number[] };
 export type ExecutableInspection = { name: string; path: string; isExecutable: boolean; instances: ExecutableInstance[] };
 
+export type InstanceAnomaly = { pid: number; score: number; baselineSamples: number; isAnomalous: boolean; summary: string; cpuPercent: number; memoryBytes: number; outboundConnections: number; novelRemoteConnections: number };
+
 export type GeoLocation = { city: string; country: string; latitude: number; longitude: number };
 export type RemoteConnection = { remoteIp: string; remotePort: number; location: GeoLocation | null };
 

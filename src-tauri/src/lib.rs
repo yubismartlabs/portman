@@ -14,9 +14,10 @@ use std::{
 };
 use sysinfo::{Pid, ProcessesToUpdate, System};
 use tauri::{
-    menu::{Menu, MenuItem},
+    image::Image,
+    menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Manager, State,
+    AppHandle, Emitter, Manager, State, WindowEvent,
 };
 use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, ShortcutState};
 use tauri_plugin_notification::NotificationExt;
@@ -179,6 +180,10 @@ pub struct SystemPosture {
 
 struct MetricsState(Mutex<System>);
 struct StopHistoryState(Mutex<HashMap<String, u32>>);
+struct MenuBarState {
+    status: MenuItem<tauri::Wry>,
+    protection: MenuItem<tauri::Wry>,
+}
 struct MemoryGuardState(Mutex<MemoryGuardConfig>);
 struct ExecutionWatcherState(Mutex<ExecutionWatcherConfig>);
 struct MemoryGuardConfig {
@@ -780,23 +785,63 @@ fn notify(app: &AppHandle, title: &str, body: String) {
     let _ = app.notification().builder().title(title).body(&body).show();
 }
 
+fn fill_menu_icon_rect(rgba: &mut [u8], x: usize, y: usize, width: usize, height: usize) {
+    for row in y..(y + height) {
+        for column in x..(x + width) {
+            let offset = (row * 18 + column) * 4;
+            rgba[offset..offset + 4].copy_from_slice(&[0, 0, 0, 255]);
+        }
+    }
+}
+
+fn menu_bar_icon() -> Image<'static> {
+    let mut rgba = vec![0; 18 * 18 * 4];
+    // A compact browser/server glyph designed as a macOS template image.
+    fill_menu_icon_rect(&mut rgba, 2, 2, 14, 1);
+    fill_menu_icon_rect(&mut rgba, 2, 3, 1, 13);
+    fill_menu_icon_rect(&mut rgba, 15, 3, 1, 13);
+    fill_menu_icon_rect(&mut rgba, 2, 15, 14, 1);
+    fill_menu_icon_rect(&mut rgba, 3, 5, 12, 1);
+    fill_menu_icon_rect(&mut rgba, 4, 3, 1, 1);
+    fill_menu_icon_rect(&mut rgba, 7, 3, 1, 1);
+    fill_menu_icon_rect(&mut rgba, 10, 3, 1, 1);
+    fill_menu_icon_rect(&mut rgba, 5, 8, 2, 2);
+    fill_menu_icon_rect(&mut rgba, 11, 8, 2, 2);
+    fill_menu_icon_rect(&mut rgba, 5, 12, 8, 1);
+    Image::new_owned(rgba, 18, 18)
+}
+
 fn configure_menu_bar(app: &tauri::App) -> tauri::Result<()> {
+    let status = MenuItem::with_id(app, "status", "PortMan is starting…", false, None::<&str>)?;
+    let protection = MenuItem::with_id(app, "protection", "Protection controls available", false, None::<&str>)?;
     let show = MenuItem::with_id(app, "show", "Show PortMan", true, None::<&str>)?;
     let scan = MenuItem::with_id(app, "scan", "Refresh listeners", true, None::<&str>)?;
+    let controls = MenuItem::with_id(app, "controls", "Open protection controls", true, None::<&str>)?;
+    let quarantine = MenuItem::with_id(app, "quarantine", "Review quarantine", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit PortMan", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &scan, &quit])?;
-    let icon = app
-        .default_window_icon()
-        .cloned()
-        .ok_or_else(|| tauri::Error::AssetNotFound("application icon".into()))?;
+    let first_separator = PredefinedMenuItem::separator(app)?;
+    let second_separator = PredefinedMenuItem::separator(app)?;
+    let menu = Menu::with_items(
+        app,
+        &[&status, &protection, &first_separator, &show, &scan, &controls, &quarantine, &second_separator, &quit],
+    )?;
 
     TrayIconBuilder::with_id("portman-menu-bar")
-        .icon(icon)
+        .icon(menu_bar_icon())
+        .icon_as_template(true)
         .tooltip("PortMan — monitoring local services")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "show" | "scan" => focus_and_scan(app),
+            "controls" => {
+                focus_and_scan(app);
+                let _ = app.emit("menu-navigate", "controls");
+            }
+            "quarantine" => {
+                focus_and_scan(app);
+                let _ = app.emit("menu-navigate", "quarantine");
+            }
             "quit" => app.exit(0),
             _ => {}
         })
@@ -811,7 +856,31 @@ fn configure_menu_bar(app: &tauri::App) -> tauri::Result<()> {
             }
         })
         .build(app)?;
+    app.manage(MenuBarState { status, protection });
     Ok(())
+}
+
+fn update_menu_bar(app: &AppHandle, listeners: &[Listener]) {
+    let Some(menu) = app.try_state::<MenuBarState>() else {
+        return;
+    };
+    let manageable = listeners.iter().filter(|listener| listener.can_stop).count();
+    let exposed = listeners
+        .iter()
+        .filter(|listener| listener.bindings.iter().any(|binding| !binding.is_localhost))
+        .count();
+    let _ = menu.status.set_text(format!(
+        "{} active listener{} · {} manageable",
+        listeners.len(),
+        if listeners.len() == 1 { "" } else { "s" },
+        manageable
+    ));
+    let protection_summary = if exposed == 0 {
+        "No externally exposed listeners".to_string()
+    } else {
+        format!("{exposed} externally exposed listener{}", if exposed == 1 { "" } else { "s" })
+    };
+    let _ = menu.protection.set_text(protection_summary);
 }
 
 fn kill_frontmost_process(app: &AppHandle) {
@@ -1809,13 +1878,32 @@ fn resume_quarantined(
 fn start_watcher(app: AppHandle) {
     std::thread::spawn(move || {
         let mut last: Vec<Listener> = Vec::new();
+        let mut listeners_initialized = false;
         let mut execution_watcher_initialized = false;
         loop {
             if let Ok(next) = scan_listeners() {
                 if next != last {
+                    if listeners_initialized {
+                        let known: HashSet<&str> = last.iter().map(|listener| listener.id.as_str()).collect();
+                        for listener in next.iter().filter(|listener| {
+                            !known.contains(listener.id.as_str())
+                                && listener.bindings.iter().any(|binding| !binding.is_localhost)
+                        }) {
+                            notify(
+                                &app,
+                                "New externally exposed service",
+                                format!(
+                                    "{} is listening on port {} beyond localhost.",
+                                    listener.process_name, listener.port
+                                ),
+                            );
+                        }
+                    }
                     let _ = app.emit("server-list-updated", &next);
+                    update_menu_bar(&app, &next);
                     last = next;
                 }
+                listeners_initialized = true;
             }
             check_memory_guard(&app);
             check_execution_watcher(&app, &mut execution_watcher_initialized);
@@ -1873,6 +1961,12 @@ pub fn run() {
             configure_menu_bar(app)?;
             start_watcher(app.handle().clone());
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
         })
         .invoke_handler(tauri::generate_handler![
             list_listeners,

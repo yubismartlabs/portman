@@ -89,6 +89,12 @@ export function PortMan() {
     listen<string>("shortcut-action", (event) => { setNotice(event.payload); refresh(); }).then((fn) => { unlistenAction = fn; });
     return () => { unlistenScan?.(); unlistenAction?.(); };
   }, [refresh]);
+  useEffect(() => {
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    let unlisten: (() => void) | undefined;
+    listen<WorkspaceTab>("menu-navigate", (event) => setWorkspaceTab(event.payload)).then((fn) => { unlisten = fn; });
+    return () => unlisten?.();
+  }, []);
   useEffect(() => { if (!("__TAURI_INTERNALS__" in window)) return; let unlisten: (() => void) | undefined; listen<MemoryGuardAlert>("memory-guard-alert", (event) => setMemoryAlert(event.payload)).then((fn) => { unlisten = fn; }); return () => unlisten?.(); }, []);
   useEffect(() => { if (!("__TAURI_INTERNALS__" in window)) return; let unlisten: (() => void) | undefined; listen<QuarantineEntry>("execution-quarantined", (event) => { setQuarantine((entries) => [event.payload, ...entries]); setWorkspaceTab("quarantine"); setNotice(`${event.payload.processName} was added to quarantine.`); }).then((fn) => { unlisten = fn; }); return () => unlisten?.(); }, []);
   useEffect(() => {
